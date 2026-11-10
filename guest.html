@@ -228,6 +228,7 @@ const state = {
   running: false, aborter: null,
   pc: null, localStream: null,
   offerReceived: false, ringReceived: false, connected: false, finished: false,
+  lastReOfferSdp: null,   // 통화 중 새 경로 제안(ICE 재시작)의 중복 처리 방지
   deadline: 0,
   timers: [],
 };
@@ -349,14 +350,56 @@ function onRing() {
   setCallStatus('벨이 울리는 중 — 상대가 받기를 기다립니다…');
 }
 
+/** SDP 의 Opus 항목에 품질·절전 옵션을 넣는다 (앱 쪽 call_tuning.dart 와 같은 값).
+ *  fmtp 는 "내가 받고 싶은 조건"이라, 여기 넣은 값은 앱이 보내는 소리에 적용된다:
+ *  useinbandfec(손실 복구), usedtx(침묵 중 안 보냄 — 상대 폰 절전), 비트레이트 상한, 모노. */
+function tuneOpusSdp(sdp) {
+  try {
+    const lines = sdp.split('\r\n');
+    const opusPts = [];
+    for (const line of lines) {
+      const m = line.match(/^a=rtpmap:(\d+)\s+opus\//i);
+      if (m) opusPts.push(m[1]);
+    }
+    if (!opusPts.length) return sdp;
+    const tuned = { useinbandfec: '1', usedtx: '1', maxaveragebitrate: '24000', stereo: '0', 'sprop-stereo': '0' };
+    for (const pt of opusPts) {
+      const prefix = 'a=fmtp:' + pt + ' ';
+      const i = lines.findIndex((l) => l.startsWith(prefix));
+      if (i >= 0) {
+        const params = {};
+        for (const piece of lines[i].slice(prefix.length).split(';')) {
+          const eq = piece.indexOf('=');
+          if (eq > 0) params[piece.slice(0, eq).trim()] = piece.slice(eq + 1).trim();
+        }
+        Object.assign(params, tuned);
+        lines[i] = prefix + Object.entries(params).map(([k, v]) => k + '=' + v).join(';');
+      } else {
+        const r = lines.findIndex((l) => new RegExp('^a=rtpmap:' + pt + '\\s', 'i').test(l));
+        if (r >= 0) lines.splice(r + 1, 0, prefix + Object.entries(tuned).map(([k, v]) => k + '=' + v).join(';'));
+      }
+    }
+    return lines.join('\r\n');
+  } catch (e) { return sdp; }   // 어떤 SDP 가 와도 통화 자체는 깨뜨리지 않는다
+}
+
 async function onOffer(message) {
-  if (state.offerReceived || state.finished || !message.sdp) return;
+  if (state.finished || !message.sdp) return;
+  if (state.offerReceived) {
+    // 통화 중 상대 망이 바뀌어 새 경로로 다시 잇자는 제안(re) — 같은 제안이 두 번 오면 한 번만
+    if (message.re && state.pc && message.sdp !== state.lastReOfferSdp) {
+      state.lastReOfferSdp = message.sdp;
+      await onReOffer(message);
+    }
+    return;
+  }
   state.offerReceived = true;
   setCallStatus('연결하는 중…');
   try {
     const pc = state.pc;
     await pc.setRemoteDescription({ type: 'offer', sdp: message.sdp });
     const answer = await pc.createAnswer();
+    answer.sdp = tuneOpusSdp(answer.sdp);
     await pc.setLocalDescription(answer);
     await waitIceGathering(pc, 3000);       // 앱과 같은 방식: 후보를 모두 모아 한 번에 보낸다
     await sendMessage('answer', { sdp: pc.localDescription.sdp });
@@ -366,6 +409,21 @@ async function onOffer(message) {
   } catch (e) {
     endCall('연결하지 못했습니다');
   }
+}
+
+/** 통화 중 ICE 재시작 제안: 새 경로로 응답해 통화를 이어 간다. 실패해도 기존 끊김 처리가 정리한다. */
+async function onReOffer(message) {
+  try {
+    const pc = state.pc;
+    await pc.setRemoteDescription({ type: 'offer', sdp: message.sdp });
+    const answer = await pc.createAnswer();
+    answer.sdp = tuneOpusSdp(answer.sdp);
+    await pc.setLocalDescription(answer);
+    await waitIceGathering(pc, 3000);
+    const send = () => sendMessage('answer', { sdp: pc.localDescription.sdp }).catch(() => {});
+    send();
+    later(5000, () => { if (!state.finished && pc.connectionState !== 'connected') send(); });
+  } catch (e) { /* 그대로 두면 연결 끊김 타이머가 정리한다 */ }
 }
 
 function onBye(message) {
@@ -394,14 +452,16 @@ async function join() {
   el('joinBtn').classList.add('hidden');
   setStatus(state.audioOnly ? '마이크를 여는 중…' : '카메라·마이크를 여는 중…');
   let stream = null;
+  // 에코 제거·잡음 억제·자동 음량 — 브라우저 기본이지만 명시해 둔다 (지원 안 해도 실패하지 않는다)
+  const audioOpts = { echoCancellation: true, noiseSuppression: true, autoGainControl: true };
   if (!state.audioOnly) {
     try {
-      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: true });
+      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: audioOpts });
     } catch (e) { /* 카메라가 없거나 거절 — 아래에서 목소리만 연다 */ }
   }
   if (!stream) {   // 음성 전용 초대이거나, 카메라를 못 열었다 — 목소리만 보낸다
     try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream = await navigator.mediaDevices.getUserMedia({ audio: audioOpts });
       el('camBtn').classList.add('hidden');
     } catch (e) {
       el('joinBtn').classList.remove('hidden');
@@ -419,7 +479,8 @@ async function join() {
     if (pc.connectionState === 'connected') { state.connected = true; setCallStatus(state.audioOnly ? '음성통화 중' : ''); }
     else if (pc.connectionState === 'failed') endCall('연결이 끊어졌습니다');
     else if (pc.connectionState === 'disconnected') {
-      later(10000, () => { if (!state.finished && pc.connectionState !== 'connected') endCall('연결이 끊어졌습니다'); });
+      // 15초: 상대 앱이 새 경로 제안(ICE 재시작)을 보내 다시 이을 시간까지 기다린다
+      later(15000, () => { if (!state.finished && pc.connectionState !== 'connected') endCall('연결이 끊어졌습니다'); });
     }
   };
   const hasLocalVideo = stream.getVideoTracks().length > 0;
