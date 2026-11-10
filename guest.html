@@ -1,0 +1,541 @@
+<!doctype html>
+<!--
+  영상통화 손님 페이지 — 앱 설치 없이 브라우저로 참여한다.
+
+  앱(폰·PC)의 [QR로 초대]가 만든 링크로 열린다: <이 페이지 주소>#g1.<방 키>
+  방 키는 # 뒤에 있어 어떤 서버로도 전송되지 않는다. 신호는 공개 우편함(ntfy)을
+  암호문으로만 오가고, 영상·음성은 WebRTC 로 기기끼리 직접 간다.
+
+  형식은 앱의 lib/core/guest_call.dart 와 같다:
+  JSON → zlib(deflate) → AES-256-GCM(방 키) → base64url → 조각 "<id8>.<i>.<n>.<data>"
+  두 구현이 같은지는 test/make_guest_vectors.mjs 가 이 파일의 라이브러리 부분을
+  그대로 불러 정답값(test/guest_vectors.json)을 만들고, Dart 시험이 그것을 푼다.
+
+  올리는 곳: 아무 정적 호스팅(GitHub Pages 등). 카메라·마이크 때문에 https 필수.
+  주소를 정한 뒤 앱의 lib/core/app_config.dart 의 kGuestPageUrl 을 같게 맞춘다.
+-->
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex">
+<title>영상통화 참여</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: system-ui, sans-serif; background: #0c1413; color: #e6f2f0;
+         min-height: 100dvh; display: flex; flex-direction: column; }
+  header { padding: 14px 16px; font-weight: 700; color: #7adfd2; }
+  main { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+         padding: 16px; gap: 16px; text-align: center; }
+  .hidden { display: none !important; }
+  button { font: inherit; border: 0; border-radius: 999px; padding: 14px 26px; cursor: pointer; }
+  .primary { background: #0e9f8c; color: #fff; font-size: 18px; font-weight: 700; }
+  .note { color: #9db8b4; font-size: 14px; line-height: 1.6; max-width: 32em; }
+  #status { color: #cfe8e4; font-size: 15px; min-height: 1.4em; }
+  /* 통화 화면 */
+  #call { position: fixed; inset: 0; background: #000; display: flex; }
+  #remoteVideo { width: 100%; height: 100%; object-fit: contain; background: #000; }
+  #localVideo { position: absolute; right: 12px; top: 12px; width: 28vw; max-width: 160px;
+                aspect-ratio: 3 / 4; object-fit: cover; border-radius: 12px; background: #15201e;
+                box-shadow: 0 2px 10px rgba(0,0,0,.5); }
+  #callStatus { position: absolute; left: 0; right: 0; top: 14px; text-align: center;
+                color: #fff; text-shadow: 0 1px 4px #000; font-size: 15px; }
+  #controls { position: absolute; left: 0; right: 0; bottom: max(20px, env(safe-area-inset-bottom));
+              display: flex; justify-content: center; gap: 18px; }
+  #controls button { width: 60px; height: 60px; padding: 0; font-size: 24px; background: rgba(255,255,255,.18); color: #fff; }
+  #controls button.off { background: rgba(255,255,255,.85); color: #111; }
+  #hangup { background: #e23b3b !important; color: #fff !important; }
+</style>
+</head>
+<body>
+<header>영상통화</header>
+<main id="setup">
+  <div id="intro" class="note"></div>
+  <div id="paste" class="hidden" style="display:flex; gap:8px; width:min(92vw,28em);">
+    <input id="pasteInput" placeholder="받은 초대 링크 붙여넣기"
+           style="flex:1; font:inherit; padding:12px; border-radius:10px; border:1px solid #2c4440; background:#15201e; color:inherit;">
+    <button id="pasteBtn" class="primary" style="padding:12px 18px; font-size:15px;">열기</button>
+  </div>
+  <button id="joinBtn" class="primary hidden">참여하기</button>
+  <div id="status"></div>
+  <a id="telBtn" class="hidden" href="#" style="color:#cfe8e4; font-size:15px;">📞 연결이 안 되면 — 전화로 걸기</a>
+  <div class="note"><span id="permNote">참여를 누르면 브라우저가 카메라·마이크 허용을 묻습니다.</span><br>
+  통화 내용은 상대 기기와 직접 연결되며 서버에 저장되지 않습니다.</div>
+  <details style="max-width:32em;">
+    <summary style="cursor:pointer; color:#7adfd2; font-size:14px;">이 QR, 안전한가요?</summary>
+    <div class="note" style="text-align:left; margin-top:8px;">
+      · 앱 설치나 파일 다운로드를 요구하지 않습니다 — 그런 요구가 뜨면 이 페이지가 아니니 닫으세요.<br>
+      · 이름·전화번호·비밀번호 등 아무것도 입력받지 않습니다.<br>
+      · 묻는 권한은 통화용 마이크(영상 초대면 카메라 포함)뿐입니다.<br>
+      · 통화는 두 기기 사이 직접 연결이고 암호화됩니다 — 서버에 저장되지 않습니다.<br>
+      · 지금 열린 주소: <b id="trustHost"></b> — 인쇄물에 적힌 주소와 같은지 확인하세요.
+    </div>
+  </details>
+</main>
+<div id="call" class="hidden">
+  <video id="remoteVideo" autoplay playsinline></video>
+  <video id="localVideo" autoplay playsinline muted></video>
+  <div id="callStatus">연결하는 중…</div>
+  <div id="controls">
+    <button id="micBtn" title="마이크">🎤</button>
+    <button id="camBtn" title="카메라">📷</button>
+    <button id="hangup" title="끊기">📵</button>
+  </div>
+</div>
+
+<script>
+'use strict';
+/*LIB-START*/
+// ── 앱(lib/core/guest_call.dart)과 똑같아야 하는 부분 ──────────────────────────
+const GUEST_TOPIC_PREFIX = 'vcg1';
+const GUEST_TOPIC_LABEL = 'videocall/guest-topic/v1';
+const MAX_CHUNK_DATA = 3800;   // 조각 하나의 최대 길이 (ntfy 글 한도 4096 미만)
+const MAX_CHUNKS = 8;
+const MAX_SEALED_LENGTH = 16 * 1024;   // 이보다 긴 암호문은 우리 신호가 아니다
+const MAX_PLAIN_BYTES = 64 * 1024;     // 압축 풀기 한도
+const MAX_AGE_MS = 2 * 60 * 1000;      // 이보다 오래된 신호는 버린다
+
+function b64uEncode(bytes) {
+  let bin = '';
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '');
+}
+
+function b64uDecode(text) {
+  const padded = text.replaceAll('-', '+').replaceAll('_', '/').padEnd(Math.ceil(text.length / 4) * 4, '=');
+  const bin = atob(padded);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+function randHex(byteCount) {
+  const bytes = crypto.getRandomValues(new Uint8Array(byteCount));
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function deflateBytes(bytes) {
+  const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream('deflate'));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+async function inflateBytes(bytes) {
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate'));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+/** 방 키 32바이트 → ntfy 토픽 (키를 아는 쪽만 토픽을 알 수 있다) */
+async function deriveTopic(keyBytes) {
+  const label = new TextEncoder().encode(GUEST_TOPIC_LABEL);
+  const input = new Uint8Array(label.length + 1 + keyBytes.length);
+  input.set(label); input[label.length] = 0; input.set(keyBytes, label.length + 1);
+  const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', input));
+  return GUEST_TOPIC_PREFIX + b64uEncode(hash);
+}
+
+async function importRoomKey(keyBytes) {
+  return crypto.subtle.importKey('raw', keyBytes, 'AES-GCM', false, ['encrypt', 'decrypt']);
+}
+
+/** 신호를 잠근다: JSON → deflate → AES-GCM → base64url(논스12 + 암호문 + 태그16) */
+async function sealMessage(keyBytes, message, nonce) {
+  const plain = new TextEncoder().encode(JSON.stringify(message));
+  const compressed = await deflateBytes(plain);
+  const iv = nonce || crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, await importRoomKey(keyBytes), compressed));
+  const out = new Uint8Array(iv.length + ct.length);
+  out.set(iv); out.set(ct, iv.length);
+  return b64uEncode(out);
+}
+
+/** 조각이 다 모인 암호문을 푼다. 우리 방의 신호가 아니면 예외. */
+async function openMessage(keyBytes, sealed, nowMs) {
+  if (sealed.length > MAX_SEALED_LENGTH) throw new Error('너무 긺');
+  const raw = b64uDecode(sealed);
+  if (raw.length < 12 + 16) throw new Error('너무 짧음');
+  let compressed;
+  try {
+    compressed = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: raw.subarray(0, 12) }, await importRoomKey(keyBytes), raw.subarray(12));
+  } catch (e) { throw new Error('복호화 실패'); }
+  const plain = await inflateBytes(new Uint8Array(compressed));
+  if (plain.length > MAX_PLAIN_BYTES) throw new Error('너무 큼');
+  const message = JSON.parse(new TextDecoder().decode(plain));
+  if (!message || message.v !== 1) throw new Error('모르는 형식');
+  if (!['join', 'ring', 'offer', 'answer', 'bye'].includes(message.t)) throw new Error('모르는 종류');
+  if (!['host', 'guest'].includes(message.role)) throw new Error('role 이 틀림');
+  if (typeof message.sid !== 'string' || !message.sid || message.sid.length > 32) throw new Error('sid 가 틀림');
+  if (typeof message.ts !== 'number' || Math.abs(nowMs - message.ts) > MAX_AGE_MS) throw new Error('너무 오래됨');
+  return message;
+}
+
+/** 암호문 → "<id8>.<i>.<n>.<data>" 조각들 */
+function splitChunks(sealed, messageId) {
+  const count = Math.ceil(sealed.length / MAX_CHUNK_DATA);
+  if (count > MAX_CHUNKS) throw new Error('신호가 너무 큼');
+  const chunks = [];
+  for (let i = 0; i < count; i++) {
+    chunks.push(`${messageId}.${i}.${count}.${sealed.slice(i * MAX_CHUNK_DATA, (i + 1) * MAX_CHUNK_DATA)}`);
+  }
+  return chunks;
+}
+
+const CHUNK_PATTERN = /^([0-9a-f]{8})\.([0-9])\.([1-9])\.([A-Za-z0-9_-]+)$/;
+
+/** 조각을 모아 완성되면 암호문을 돌려준다 (Dart 의 ChunkReassembler 와 같은 규칙) */
+function makeReassembler() {
+  const pending = new Map();
+  const completed = new Set();
+  return function add(body) {
+    const match = CHUNK_PATTERN.exec(body.trim());
+    if (!match) return null;
+    const [, id, indexText, totalText, data] = match;
+    const index = Number(indexText), total = Number(totalText);
+    if (index >= total || total > MAX_CHUNKS || data.length > MAX_CHUNK_DATA || completed.has(id)) return null;
+    let entry = pending.get(id);
+    if (!entry) {
+      if (pending.size >= 32) pending.delete(pending.keys().next().value);
+      entry = { total, parts: new Array(total).fill(null) };
+      pending.set(id, entry);
+    }
+    if (entry.total !== total) return null;
+    entry.parts[index] = data;
+    if (entry.parts.includes(null)) return null;
+    pending.delete(id);
+    completed.add(id);
+    return entry.parts.join('');
+  };
+}
+
+const GuestLib = { b64uEncode, b64uDecode, randHex, deriveTopic, sealMessage, openMessage, splitChunks, makeReassembler, deflateBytes, inflateBytes };
+/*LIB-END*/
+
+// ── 여기부터는 화면·연결 (브라우저에서만 돈다) ─────────────────────────────────
+// 신호 우편함 서버 — 앱의 lib/core/app_config.dart 의 kSignalServerUrl 과 같아야 한다
+const SIGNAL_SERVER = 'https://ntfy.sh';
+// 앱의 lib/core/call_media.dart 와 같은 STUN 목록
+const RTC_CONFIG = { iceServers: [
+  { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
+  { urls: ['stun:stun.cloudflare.com:3478'] },
+] };
+
+const el = (id) => document.getElementById(id);
+const setStatus = (text) => { el('status').textContent = text; };
+
+const state = {
+  keyBytes: null, topic: null, local: false, audioOnly: false, sid: randHex(4),
+  running: false, aborter: null,
+  pc: null, localStream: null,
+  offerReceived: false, ringReceived: false, connected: false, finished: false,
+  deadline: 0,
+  timers: [],
+};
+
+function later(ms, fn) { state.timers.push(setTimeout(fn, ms)); }
+function clearTimers() { for (const t of state.timers) clearTimeout(t); state.timers = []; }
+
+function parseLink() {
+  const hash = location.hash.replace(/^#/, '');
+  const parts = hash.split('.');
+  // g1 = 공개 우편함(ntfy) 모드, l1 = 로컬 모드(이 페이지를 준 서버로 직접 신호)
+  // 키 뒤의 표시(앱의 inviteLink 와 같은 형식):
+  //   'a'      = 음성 전용 초대 (카메라를 아예 열지 않는다)
+  //   't<번호>' = 인터넷이 안 될 때 전화로 걸기 (선택 — 초대한 쪽이 켰을 때만 붙는다)
+  if (parts.length < 2 || (parts[0] !== 'g1' && parts[0] !== 'l1')) return null;
+  let audioOnly = false;
+  let telNumber = null;
+  for (const flag of parts.slice(2)) {
+    if (flag === 'a') audioOnly = true;
+    else if (/^t\d{7,15}$/.test(flag)) telNumber = flag.slice(1);
+    else return null;
+  }
+  try {
+    const keyBytes = b64uDecode(parts[1]);
+    if (keyBytes.length !== 32) return null;
+    return { keyBytes, local: parts[0] === 'l1', audioOnly, telNumber };
+  } catch (e) { return null; }
+}
+
+async function publish(body) {
+  const url = state.local
+    ? '/room'   // 로컬 모드: 이 페이지를 준 PC 가 곧 신호 서버다
+    : `${SIGNAL_SERVER}/${state.topic}?cache=no&firebase=no`;
+  const response = await fetch(url, { method: 'POST', body });
+  if (!response.ok) throw new Error(`신호를 받아 주지 않음 (${response.status})`);
+}
+
+async function sendMessage(type, extra) {
+  const message = { v: 1, t: type, role: 'guest', sid: state.sid, ts: Date.now(), ...extra };
+  const sealed = await sealMessage(state.keyBytes, message);
+  for (const chunk of splitChunks(sealed, randHex(4))) {
+    await publish(chunk);
+  }
+}
+
+/** 로컬 모드: PC 가 쌓아 둔 신호 조각을 1초마다 가져온다. */
+async function subscribeLocal(onBody) {
+  const reassemble = makeReassembler();
+  state.running = true;
+  let after = 0;
+  while (state.running) {
+    try {
+      const response = await fetch(`/poll?after=${after}`);
+      if (response.ok) {
+        const data = await response.json();
+        after = data.next;
+        for (const item of data.items ?? []) {
+          const sealed = reassemble(String(item));
+          if (sealed) await onBody(sealed);
+        }
+      }
+    } catch (e) { /* 잠시 끊김 — 다음 바퀴에 다시 */ }
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+}
+
+/** 우편함 구독 (ndjson 스트림). 끊기면 몇 초 뒤 다시 붙는다. */
+async function subscribe(onBody) {
+  const reassemble = makeReassembler();
+  state.running = true;
+  while (state.running) {
+    state.aborter = new AbortController();
+    try {
+      const response = await fetch(`${SIGNAL_SERVER}/${state.topic}/json`, { signal: state.aborter.signal });
+      if (!response.ok || !response.body) throw new Error(`구독 실패 (${response.status})`);
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let newline;
+        while ((newline = buffer.indexOf('\n')) >= 0) {
+          const line = buffer.slice(0, newline).trim();
+          buffer = buffer.slice(newline + 1);
+          if (!line) continue;
+          try {
+            const event = JSON.parse(line);
+            if (event.event === 'message' && typeof event.message === 'string') {
+              const sealed = reassemble(event.message);
+              if (sealed) await onBody(sealed);
+            }
+          } catch (e) { /* 우리 신호가 아닌 줄은 버린다 */ }
+        }
+      }
+    } catch (e) { /* 망 전환 등 — 아래에서 다시 붙는다 */ }
+    if (state.running) await new Promise((r) => setTimeout(r, 2000 + Math.random() * 2000));
+  }
+}
+
+async function onSealed(sealed) {
+  let message;
+  try {
+    message = await openMessage(state.keyBytes, sealed, Date.now());
+  } catch (e) { return; }
+  if (message.role !== 'guest') {           // 내 사본은 버린다
+    if (message.t === 'offer' && message.sid === state.sid) await onOffer(message);
+    else if (message.t === 'ring' && message.sid === state.sid) onRing();
+    else if (message.t === 'bye') onBye(message);
+  }
+}
+
+/** 인쇄된 고정 QR: 상대(PC) 쪽에서 벨이 울리는 중 — 받을 때까지 더 기다린다 */
+function onRing() {
+  if (state.finished || state.offerReceived || state.ringReceived) return;
+  state.ringReceived = true;
+  state.deadline = Date.now() + 120000;
+  setCallStatus('벨이 울리는 중 — 상대가 받기를 기다립니다…');
+}
+
+async function onOffer(message) {
+  if (state.offerReceived || state.finished || !message.sdp) return;
+  state.offerReceived = true;
+  setCallStatus('연결하는 중…');
+  try {
+    const pc = state.pc;
+    await pc.setRemoteDescription({ type: 'offer', sdp: message.sdp });
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    await waitIceGathering(pc, 3000);       // 앱과 같은 방식: 후보를 모두 모아 한 번에 보낸다
+    await sendMessage('answer', { sdp: pc.localDescription.sdp });
+    later(5000, () => {                      // answer 가 안 닿았을 때 한 번 더
+      if (!state.connected && !state.finished) sendMessage('answer', { sdp: pc.localDescription.sdp }).catch(() => {});
+    });
+  } catch (e) {
+    endCall('연결하지 못했습니다');
+  }
+}
+
+function onBye(message) {
+  if (state.finished || message.sid !== state.sid) return;
+  const reasons = {
+    busy: '상대가 통화 중입니다. 잠시 후 다시 해 보세요.',
+    noanswer: '응답이 없습니다. 잠시 후 다시 해 보세요.',
+    decline: '상대가 지금 받을 수 없습니다.',
+  };
+  endCall(reasons[message.reason] || '상대가 통화를 끝냈습니다');
+}
+
+function waitIceGathering(pc, timeoutMs) {
+  if (pc.iceGatheringState === 'complete') return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, timeoutMs);
+    pc.addEventListener('icegatheringstatechange', () => {
+      if (pc.iceGatheringState === 'complete') { clearTimeout(timer); resolve(); }
+    });
+  });
+}
+
+function setCallStatus(text) { el('callStatus').textContent = text; }
+
+async function join() {
+  el('joinBtn').classList.add('hidden');
+  setStatus(state.audioOnly ? '마이크를 여는 중…' : '카메라·마이크를 여는 중…');
+  let stream = null;
+  if (!state.audioOnly) {
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: true });
+    } catch (e) { /* 카메라가 없거나 거절 — 아래에서 목소리만 연다 */ }
+  }
+  if (!stream) {   // 음성 전용 초대이거나, 카메라를 못 열었다 — 목소리만 보낸다
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      el('camBtn').classList.add('hidden');
+    } catch (e) {
+      el('joinBtn').classList.remove('hidden');
+      setStatus('마이크를 허용해야 통화할 수 있습니다. 브라우저 주소창의 권한에서 허용해 주세요.');
+      return;
+    }
+  }
+  state.localStream = stream;
+  const pc = new RTCPeerConnection(RTC_CONFIG);
+  state.pc = pc;
+  for (const track of stream.getTracks()) pc.addTrack(track, stream);
+  pc.ontrack = (event) => { if (event.streams[0]) el('remoteVideo').srcObject = event.streams[0]; };
+  pc.onconnectionstatechange = () => {
+    if (state.finished) return;
+    if (pc.connectionState === 'connected') { state.connected = true; setCallStatus(state.audioOnly ? '음성통화 중' : ''); }
+    else if (pc.connectionState === 'failed') endCall('연결이 끊어졌습니다');
+    else if (pc.connectionState === 'disconnected') {
+      later(10000, () => { if (!state.finished && pc.connectionState !== 'connected') endCall('연결이 끊어졌습니다'); });
+    }
+  };
+  const hasLocalVideo = stream.getVideoTracks().length > 0;
+  el('localVideo').srcObject = hasLocalVideo ? stream : null;
+  el('localVideo').classList.toggle('hidden', !hasLocalVideo);
+  el('setup').classList.add('hidden');
+  el('call').classList.remove('hidden');
+  setCallStatus('상대를 기다리는 중…');
+
+  if (state.local) subscribeLocal(onSealed); else subscribe(onSealed);
+  const sendJoin = () => sendMessage('join', {}).catch(() => setCallStatus('우편함에 보내지 못했습니다 — 망을 확인해 주세요'));
+  sendJoin();
+  // 벨 신호(ring)를 받으면 상대가 받을 때까지 더 기다린다 (deadline 연장)
+  state.deadline = Date.now() + 60000;
+  const resendIfSilent = () => { if (!state.offerReceived && !state.ringReceived && !state.finished) sendJoin(); };
+  later(4000, resendIfSilent);
+  later(9000, resendIfSilent);
+  later(20000, resendIfSilent);
+  const watchdog = setInterval(() => {
+    if (state.finished || state.connected) { clearInterval(watchdog); return; }
+    if (Date.now() > state.deadline) {
+      clearInterval(watchdog);
+      endCall(state.ringReceived
+        ? '응답이 없습니다. 잠시 후 다시 해 보세요.'
+        : '연결되지 않았습니다. 상대의 영상통화 프로그램이 켜져 있는지 확인해 주세요.');
+    }
+  }, 3000);
+  state.timers.push(watchdog);
+}
+
+function endCall(reason) {
+  if (state.finished) return;
+  state.finished = true;
+  state.running = false;
+  clearTimers();
+  try { state.aborter?.abort(); } catch (e) {}
+  try { state.pc?.close(); } catch (e) {}
+  for (const track of state.localStream?.getTracks() ?? []) track.stop();
+  el('call').classList.add('hidden');
+  el('setup').classList.remove('hidden');
+  el('intro').textContent = reason;
+  setStatus('창을 닫아도 됩니다.');
+}
+
+function toggleTrack(kinds, button) {
+  const tracks = kinds === 'audio' ? state.localStream?.getAudioTracks() : state.localStream?.getVideoTracks();
+  if (!tracks || !tracks.length) return;
+  const enabled = !tracks[0].enabled;
+  for (const track of tracks) track.enabled = enabled;
+  button.classList.toggle('off', !enabled);
+}
+
+function main() {
+  el('trustHost').textContent = location.host;   // "이 QR, 안전한가요?" 안내의 주소 확인용
+  const parsed = parseLink();
+  const keyBytes = parsed ? parsed.keyBytes : null;
+  if (!keyBytes) {
+    el('intro').textContent = '초대 링크로 열어 주세요. 영상통화 앱의 [QR로 초대] 화면에 있는 QR를 찍거나, 받은 링크를 아래에 붙여 넣으세요.';
+    el('paste').classList.remove('hidden');
+    el('pasteBtn').addEventListener('click', () => {
+      const hashIndex = el('pasteInput').value.indexOf('#');
+      if (hashIndex < 0) { setStatus('링크에 # 부분이 없습니다. 링크 전체를 붙여 넣어 주세요.'); return; }
+      location.hash = el('pasteInput').value.slice(hashIndex + 1);
+      location.reload();
+    });
+    return;
+  }
+  if (!window.isSecureContext || !navigator.mediaDevices) {
+    el('intro').textContent = '이 주소에서는 카메라·마이크를 쓸 수 없습니다 (https 로 열어야 합니다).';
+    return;
+  }
+  state.keyBytes = keyBytes;
+  state.local = parsed.local;
+  state.audioOnly = parsed.audioOnly;
+  el('intro').textContent = state.audioOnly ? '음성통화에 초대받았습니다.' : '영상통화에 초대받았습니다.';
+  if (state.audioOnly) {
+    document.title = '음성통화 참여';
+    document.querySelector('header').textContent = '음성통화';
+    el('permNote').textContent = '참여를 누르면 브라우저가 마이크 허용을 묻습니다 (카메라는 쓰지 않습니다).';
+  }
+  if (parsed.telNumber) {
+    // 초대한 쪽이 "인터넷이 안 될 때 전화로 연결"을 켰다 — 연결이 안 되면 일반 전화로 걸 수 있게 한다
+    const telBtn = el('telBtn');
+    telBtn.href = 'tel:' + parsed.telNumber;
+    telBtn.classList.remove('hidden');
+  }
+  if (state.local) {
+    // 로컬 모드: 신호가 이 서버로 직접 가므로 토픽이 필요 없다
+    el('joinBtn').classList.remove('hidden');
+  } else {
+    deriveTopic(keyBytes).then((topic) => {
+      state.topic = topic;
+      el('joinBtn').classList.remove('hidden');
+    });
+  }
+  el('joinBtn').addEventListener('click', join);
+  el('hangup').addEventListener('click', async () => {
+    try { await sendMessage('bye', {}); } catch (e) {}
+    endCall('통화를 끝냈습니다');
+  });
+  el('micBtn').addEventListener('click', () => toggleTrack('audio', el('micBtn')));
+  el('camBtn').addEventListener('click', () => toggleTrack('video', el('camBtn')));
+  // 창을 닫을 때 상대에게 알린다 (sendBeacon 은 떠나는 중에도 전송된다)
+  addEventListener('pagehide', () => {
+    if (state.finished || !state.pc) return;
+    const target = state.local ? '/room' : `${SIGNAL_SERVER}/${state.topic}?cache=no&firebase=no`;
+    sealMessage(state.keyBytes, { v: 1, t: 'bye', role: 'guest', sid: state.sid, ts: Date.now() })
+      .then((sealed) => {
+        for (const chunk of splitChunks(sealed, randHex(4))) {
+          navigator.sendBeacon(target, chunk);
+        }
+      }).catch(() => {});
+  });
+}
+
+if (typeof document !== 'undefined') main();
+</script>
+</body>
+</html>
