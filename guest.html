@@ -218,7 +218,10 @@ const SIGNAL_SERVER = 'https://ntfy.sh';
 const RTC_CONFIG = { iceServers: [
   { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
   { urls: ['stun:stun.cloudflare.com:3478'] },
-] };
+], iceCandidatePoolSize: 1 };   // 연결 후보를 미리 모아 연결 수립이 빨라진다
+
+// 에코 제거·잡음 억제·자동 음량 — 브라우저 기본이지만 명시해 둔다 (지원 안 해도 실패하지 않는다)
+const AUDIO_OPTS = { echoCancellation: true, noiseSuppression: true, autoGainControl: true };
 
 const el = (id) => document.getElementById(id);
 const setStatus = (text) => { el('status').textContent = text; };
@@ -229,6 +232,7 @@ const state = {
   pc: null, localStream: null,
   offerReceived: false, ringReceived: false, connected: false, finished: false,
   lastReOfferSdp: null,   // 통화 중 새 경로 제안(ICE 재시작)의 중복 처리 방지
+  wakeLock: null,         // 통화 중 화면 꺼짐 방지 (전화 앱처럼)
   deadline: 0,
   timers: [],
 };
@@ -379,8 +383,28 @@ function tuneOpusSdp(sdp) {
         if (r >= 0) lines.splice(r + 1, 0, prefix + Object.entries(tuned).map(([k, v]) => k + '=' + v).join(';'));
       }
     }
+    preferRed(lines);
     return lines.join('\r\n');
   } catch (e) { return sdp; }   // 어떤 SDP 가 와도 통화 자체는 깨뜨리지 않는다
+}
+
+/** m=audio 줄에서 RED(이중 전송, red/48000)를 코덱 1순위로 — 손실망에서 FEC 보다 강하게 복구된다.
+ *  RED 가 제안에 없으면(미지원 쪽) 아무것도 안 바꾼다. 앱 쪽 call_tuning.dart 와 같은 규칙. */
+function preferRed(lines) {
+  const redPts = new Set();
+  for (const line of lines) {
+    const m = line.match(/^a=rtpmap:(\d+)\s+red\/48000/i);
+    if (m) redPts.add(m[1]);
+  }
+  if (!redPts.size) return;
+  const i = lines.findIndex((l) => l.startsWith('m=audio '));
+  if (i < 0) return;
+  const parts = lines[i].split(' ');
+  if (parts.length <= 4) return;
+  const payloads = parts.slice(3);
+  const red = payloads.filter((pt) => redPts.has(pt));
+  if (!red.length) return;
+  lines[i] = parts.slice(0, 3).concat(red, payloads.filter((pt) => !redPts.has(pt))).join(' ');
 }
 
 async function onOffer(message) {
@@ -452,16 +476,14 @@ async function join() {
   el('joinBtn').classList.add('hidden');
   setStatus(state.audioOnly ? '마이크를 여는 중…' : '카메라·마이크를 여는 중…');
   let stream = null;
-  // 에코 제거·잡음 억제·자동 음량 — 브라우저 기본이지만 명시해 둔다 (지원 안 해도 실패하지 않는다)
-  const audioOpts = { echoCancellation: true, noiseSuppression: true, autoGainControl: true };
   if (!state.audioOnly) {
     try {
-      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: audioOpts });
+      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: AUDIO_OPTS });
     } catch (e) { /* 카메라가 없거나 거절 — 아래에서 목소리만 연다 */ }
   }
   if (!stream) {   // 음성 전용 초대이거나, 카메라를 못 열었다 — 목소리만 보낸다
     try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: audioOpts });
+      stream = await navigator.mediaDevices.getUserMedia({ audio: AUDIO_OPTS });
       el('camBtn').classList.add('hidden');
     } catch (e) {
       el('joinBtn').classList.remove('hidden');
@@ -476,13 +498,21 @@ async function join() {
   pc.ontrack = (event) => { if (event.streams[0]) el('remoteVideo').srcObject = event.streams[0]; };
   pc.onconnectionstatechange = () => {
     if (state.finished) return;
-    if (pc.connectionState === 'connected') { state.connected = true; setCallStatus(state.audioOnly ? '음성통화 중' : ''); }
+    if (pc.connectionState === 'connected') {
+      state.connected = true;
+      setCallStatus(state.audioOnly ? '음성통화 중' : '');
+      markAudioPriority(pc);   // 소리 패킷에 QoS 우선 표시 (지원 브라우저만 — 안 돼도 무해)
+    }
     else if (pc.connectionState === 'failed') endCall('연결이 끊어졌습니다');
     else if (pc.connectionState === 'disconnected') {
       // 15초: 상대 앱이 새 경로 제안(ICE 재시작)을 보내 다시 이을 시간까지 기다린다
+      if (state.connected) setCallStatus('연결이 불안정합니다 — 다시 잇는 중…');
       later(15000, () => { if (!state.finished && pc.connectionState !== 'connected') endCall('연결이 끊어졌습니다'); });
     }
   };
+  keepScreenAwake();   // 통화 중 화면이 꺼지면 일부 브라우저가 페이지를 멈춘다 — 전화 앱처럼 켜 둔다
+  const micTrack = stream.getAudioTracks()[0];
+  if (micTrack) watchMicTrack(pc, micTrack);   // 마이크를 뺏기면(블루투스 분리 등) 다시 열어 갈아 끼운다
   const hasLocalVideo = stream.getVideoTracks().length > 0;
   el('localVideo').srcObject = hasLocalVideo ? stream : null;
   el('localVideo').classList.toggle('hidden', !hasLocalVideo);
@@ -511,10 +541,57 @@ async function join() {
   state.timers.push(watchdog);
 }
 
+/** 소리 보내는 패킷에 QoS 우선 표시(DSCP). 지원 브라우저만 적용되고, 안 돼도 통화에는 영향 없다. */
+function markAudioPriority(pc) {
+  try {
+    const sender = pc.getSenders().find((s) => s.track && s.track.kind === 'audio');
+    if (!sender) return;
+    const params = sender.getParameters();
+    if (!params.encodings || !params.encodings.length) return;
+    params.encodings[0].networkPriority = 'high';
+    params.encodings[0].priority = 'high';
+    sender.setParameters(params).catch(() => {});
+  } catch (e) {}
+}
+
+/** 마이크 트랙이 죽으면(기기 분리·권한 회수) 새로 열어 보내는 소리만 갈아 끼운다 — 통화는 끊기지 않는다.
+ *  옛 단말의 부분 재시작(오디오 서브시스템만 되살리기)과 같은 생각이다. */
+function watchMicTrack(pc, track) {
+  track.onended = async () => {
+    if (state.finished) return;
+    setCallStatus('마이크가 끊겨 다시 여는 중…');
+    try {
+      const fresh = await navigator.mediaDevices.getUserMedia({ audio: AUDIO_OPTS });
+      const newTrack = fresh.getAudioTracks()[0];
+      const sender = pc.getSenders().find((s) => s.track && s.track.kind === 'audio');
+      if (!newTrack || !sender) throw new Error('없음');
+      await sender.replaceTrack(newTrack);
+      watchMicTrack(pc, newTrack);   // 새 트랙도 똑같이 지켜본다
+      setCallStatus(state.audioOnly ? '음성통화 중' : '');
+    } catch (e) {
+      setCallStatus('마이크를 다시 열지 못했습니다 — 브라우저 권한을 확인해 주세요');
+    }
+  };
+}
+
+/** 통화 중 화면 꺼짐 방지. 지원 안 하거나 거절돼도 통화는 그대로 된다.
+ *  화면을 껐다 켜면(잠금 등) 브라우저가 걸쇠를 풀어 버리므로, 다시 보일 때 또 잡는다. */
+async function keepScreenAwake() {
+  if (!('wakeLock' in navigator)) return;
+  try { state.wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
+  document.addEventListener('visibilitychange', async () => {
+    if (document.visibilityState === 'visible' && !state.finished) {
+      try { state.wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
+    }
+  });
+}
+
 function endCall(reason) {
   if (state.finished) return;
   state.finished = true;
   state.running = false;
+  try { state.wakeLock?.release(); } catch (e) {}
+  state.wakeLock = null;
   clearTimers();
   try { state.aborter?.abort(); } catch (e) {}
   try { state.pc?.close(); } catch (e) {}
