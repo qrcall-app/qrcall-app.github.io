@@ -53,7 +53,7 @@
 <main id="setup">
   <div id="intro" class="note"></div>
   <div id="paste" class="hidden" style="display:flex; gap:8px; width:min(92vw,28em);">
-    <input id="pasteInput" placeholder="받은 초대 링크 붙여넣기"
+    <input id="pasteInput" placeholder="받은 통화 링크 붙여넣기"
            style="flex:1; font:inherit; padding:12px; border-radius:10px; border:1px solid #2c4440; background:#15201e; color:inherit;">
     <button id="pasteBtn" class="primary" style="padding:12px 18px; font-size:15px;">열기</button>
   </div>
@@ -67,7 +67,7 @@
     <div class="note" style="text-align:left; margin-top:8px;">
       · 앱 설치나 파일 다운로드를 요구하지 않습니다 — 그런 요구가 뜨면 이 페이지가 아니니 닫으세요.<br>
       · 이름·전화번호·비밀번호 등 아무것도 입력받지 않습니다.<br>
-      · 묻는 권한은 통화용 마이크(영상 초대면 카메라 포함)뿐입니다.<br>
+      · 묻는 권한은 통화용 마이크(영상통화면 카메라 포함)뿐입니다.<br>
       · 통화는 두 기기 사이 직접 연결이고 암호화됩니다 — 서버에 저장되지 않습니다.<br>
       · 지금 열린 주소: <b id="trustHost"></b> — 인쇄물에 적힌 주소와 같은지 확인하세요.
     </div>
@@ -615,7 +615,7 @@ function main() {
   const parsed = parseLink();
   const keyBytes = parsed ? parsed.keyBytes : null;
   if (!keyBytes) {
-    el('intro').textContent = '초대 링크로 열어 주세요. 영상통화 앱의 [QR로 초대] 화면에 있는 QR를 찍거나, 받은 링크를 아래에 붙여 넣으세요.';
+    el('intro').textContent = 'QR를 찍어서 열어 주세요. QR콜 앱의 QR 화면에 있는 QR를 찍거나, 받은 통화 링크를 아래에 붙여 넣으세요.';
     el('paste').classList.remove('hidden');
     el('pasteBtn').addEventListener('click', () => {
       const hashIndex = el('pasteInput').value.indexOf('#');
@@ -632,7 +632,7 @@ function main() {
   state.keyBytes = keyBytes;
   state.local = parsed.local;
   state.audioOnly = parsed.audioOnly;
-  el('intro').textContent = state.audioOnly ? '음성통화에 초대받았습니다.' : '영상통화에 초대받았습니다.';
+  el('intro').textContent = state.audioOnly ? '앱 설치 없이 바로 음성통화를 걸 수 있습니다.' : '앱 설치 없이 바로 영상통화를 걸 수 있습니다.';
   if (state.audioOnly) {
     document.title = '음성통화';
     document.querySelector('header').textContent = '음성통화';
