@@ -354,9 +354,9 @@ function onRing() {
   setCallStatus('벨이 울리는 중 — 상대가 받기를 기다립니다…');
 }
 
-/** SDP 의 Opus 항목에 품질·절전 옵션을 넣는다 (앱 쪽 call_tuning.dart 와 같은 값).
+/** SDP 의 Opus 항목에 품질 옵션을 넣는다 (앱 쪽 call_tuning.dart 와 같은 값).
  *  fmtp 는 "내가 받고 싶은 조건"이라, 여기 넣은 값은 앱이 보내는 소리에 적용된다:
- *  useinbandfec(손실 복구), usedtx(침묵 중 안 보냄 — 상대 폰 절전), 비트레이트 상한, 모노. */
+ *  useinbandfec(손실 복구), 비트레이트 상한 40k(기본 32k 보다 낮게 주면 음질을 깎는다), 모노. DTX 는 일부러 안 쓴다. */
 function tuneOpusSdp(sdp) {
   try {
     const lines = sdp.split('\r\n');
@@ -366,7 +366,7 @@ function tuneOpusSdp(sdp) {
       if (m) opusPts.push(m[1]);
     }
     if (!opusPts.length) return sdp;
-    const tuned = { useinbandfec: '1', usedtx: '1', maxaveragebitrate: '24000', stereo: '0', 'sprop-stereo': '0' };
+    const tuned = { useinbandfec: '1', maxaveragebitrate: '40000', stereo: '0', 'sprop-stereo': '0' };
     for (const pt of opusPts) {
       const prefix = 'a=fmtp:' + pt + ' ';
       const i = lines.findIndex((l) => l.startsWith(prefix));
@@ -541,13 +541,15 @@ async function join() {
   state.timers.push(watchdog);
 }
 
-/** 소리 보내는 패킷에 QoS 우선 표시(DSCP). 지원 브라우저만 적용되고, 안 돼도 통화에는 영향 없다. */
+/** 보내는 소리의 송신 설정: 비트레이트 상한 40k(기본 32k 에서 올림 — 앱 쪽 call_tuning.dart 와 같은 값)와
+ *  QoS 우선 표시(DSCP). 지원 브라우저만 적용되고, 안 돼도 통화에는 영향 없다. */
 function markAudioPriority(pc) {
   try {
     const sender = pc.getSenders().find((s) => s.track && s.track.kind === 'audio');
     if (!sender) return;
     const params = sender.getParameters();
     if (!params.encodings || !params.encodings.length) return;
+    params.encodings[0].maxBitrate = 40000;
     params.encodings[0].networkPriority = 'high';
     params.encodings[0].priority = 'high';
     sender.setParameters(params).catch(() => {});
