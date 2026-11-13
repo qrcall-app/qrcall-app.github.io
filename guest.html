@@ -231,8 +231,12 @@ const RTC_CONFIG = { iceServers: [
   { urls: ['stun:stun.cloudflare.com:3478'] },
 ], iceCandidatePoolSize: 1 };   // 연결 후보를 미리 모아 연결 수립이 빨라진다
 
-// 에코 제거·잡음 억제·자동 음량 — 브라우저 기본이지만 명시해 둔다 (지원 안 해도 실패하지 않는다)
-const AUDIO_OPTS = { echoCancellation: true, noiseSuppression: true, autoGainControl: true };
+// 에코 제거는 'remote-only'(상대 소리만 지움, 크롬 141+ 지원). 이유 — 크롬 안드로이드 소스(audio_manager_android.cc)에서
+// 마이크를 열 때 "폰 자체 에코 제거(platform AEC)"를 쓰는 경우에만 폰을 OS 통화 모드(MODE_IN_COMMUNICATION)로 바꾼다.
+// 통화 모드로 바뀌면 안드로이드 12+(특히 삼성)의 출력 장치 선택 버그 때문에 볼륨 키를 누르기 전까지 소리가 안 났다.
+// 'remote-only' 는 크롬 자체 에코 제거(AEC3)를 쓰므로 통화 모드로 안 바뀌고, 소리는 보통 미디어 경로로 바로 나온다
+// (마이크를 안 여는 guidecast listen.html 이 늘 들리는 것과 같은 경로). 지원 안 하는 브라우저는 이 문자열을 true 로 읽는다.
+const AUDIO_OPTS = { echoCancellation: 'remote-only', noiseSuppression: true, autoGainControl: true };
 
 const el = (id) => document.getElementById(id);
 const setStatus = (text) => { el('status').textContent = text; };
@@ -556,9 +560,8 @@ async function join() {
   const pc = new RTCPeerConnection(RTC_CONFIG);
   state.pc = pc;
   for (const track of stream.getTracks()) pc.addTrack(track, stream);
-  // 상대 소리는 붙이기만 한다(autoplay 가 재생). 이 페이지에서 다른 소리(신호음 등)를 먼저 재생하거나
-  // 재생을 미리 걸어 두면 안드로이드 크롬이 소리를 통화 경로가 아닌 곳으로 보내, 볼륨 단추를 눌러야 들리고
-  // 에코 제거도 안 되는 문제가 있었다(2026-11-13~14). 신호음을 다시 넣을 때는 이 점을 먼저 확인할 것.
+  // 상대 소리는 붙이기만 한다(autoplay 가 재생). "볼륨 단추를 눌러야 들리는" 문제(2026-11-13~14)의 원인은
+  // 이 재생 순서가 아니라 OS 통화 모드 전환이었다 — AUDIO_OPTS 주석 참고. 신호음을 다시 넣을 때는 그 점을 먼저 확인할 것.
   pc.ontrack = (event) => { if (event.streams[0]) el('remoteVideo').srcObject = event.streams[0]; };
   pc.onconnectionstatechange = () => {
     if (state.finished) return;
@@ -685,7 +688,7 @@ function startAudioDiag(pc) {
       const rxRate = lastRx === null ? '-' : String(rx - lastRx);
       const txRate = lastTx === null ? '-' : String(tx - lastTx);
       lastRx = rx; lastTx = tx;
-      el('diag').textContent = `받음 ${rxRate}/초 · 음량 ${peak.toFixed(2)} · 보냄 ${txRate}/초 · ${mime} · ${play}`;
+      el('diag').textContent = `받음 ${rxRate}/초 · 음량 ${peak.toFixed(2)} · 보냄 ${txRate}/초 · ${mime} · ${play} · AEC ${effectiveAecMode()}`;
     } catch (e) { el('diag').textContent = '진단 읽기 실패'; }
     later(1000, tick);
   };
@@ -752,14 +755,23 @@ async function announceReady(pc) {
   });
 }
 
+/** 브라우저가 실제로 적용한 에코 제거 방식. 'remote-only' 면 크롬 자체 제거(폰이 통화 모드로 안 바뀜),
+ *  'true' 면 옛 방식(폰 자체 제거 → 통화 모드), 'false' 면 없음, '?' 면 마이크가 아직 없다. */
+function effectiveAecMode() {
+  const mic = state.localStream && state.localStream.getAudioTracks()[0];
+  if (!mic) return '?';
+  const value = mic.getSettings().echoCancellation;
+  return value === undefined ? '?' : String(value);
+}
+
 /** 안드로이드 방문자에게 "안 들리면 볼륨 올림(+)을 한 번 누르세요" 안내를 띄운다.
- *  크롬은 마이크를 열면 폰을 통화 모드로 바꾸는데, 안드로이드 12+ (특히 삼성)에는 통화 모드의 출력 장치가
- *  볼륨 키를 누르기 전까지 잡히지 않는 버그가 있다. 네이티브 앱은 코드로 볼륨을 한 번 건드려 피하지만
- *  (개발자들이 "hack for samsung no audio bug" 라고 부른다) 웹 페이지는 OS 볼륨을 건드릴 수 없다.
- *  그래서 재생을 다시 거는 단추로는 해결되지 않고, 사용자가 직접 누르게 안내하는 것이 웹에서 가능한 전부다.
- *  다른 폰 방문자는 그냥 들리므로 안내는 45초 뒤 또는 누르면 사라진다. */
+ *  크롬이 마이크를 열며 폰을 통화 모드로 바꾸는 경우에만 해당한다 — 안드로이드 12+ (특히 삼성)에는 통화 모드의
+ *  출력 장치가 볼륨 키를 누르기 전까지 잡히지 않는 버그가 있다(네이티브 개발자들의 "hack for samsung no audio bug").
+ *  AUDIO_OPTS 의 'remote-only' 가 적용된 브라우저는 통화 모드로 바뀌지 않으므로 안내를 띄우지 않고,
+ *  그 값을 모르는 옛 브라우저(true 로 읽음)에만 띄운다. 안내는 45초 뒤 또는 누르면 사라진다. */
 function showVolumeHint() {
   if (!/Android/i.test(navigator.userAgent)) return;   // 아이폰·PC 에는 이 버그가 없다
+  if (effectiveAecMode() === 'remote-only') return;     // 통화 모드로 안 바뀌는 경로 — 버그가 나지 않는다
   const hint = el('volumeHint');
   hint.classList.remove('hidden');
   hint.onclick = () => hint.classList.add('hidden');
