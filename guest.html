@@ -50,6 +50,9 @@
               display: flex; justify-content: center; gap: 18px; }
   #controls button { width: 60px; height: 60px; padding: 0; font-size: 24px; background: rgba(255,255,255,.18); color: #fff; }
   #controls button.off { background: rgba(255,255,255,.85); color: #111; }
+  /* 안드로이드 크롬은 사용자 동작 전에는 상대 소리를 막을 때가 있다 — 누르면 소리가 켜지는 단추 */
+  #soundBtn { position: absolute; left: 50%; transform: translateX(-50%); bottom: 120px;
+              padding: 12px 20px; font-size: 16px; background: #1E56C8; color: #fff; border: 0; border-radius: 24px; }
   #hangup { background: #e23b3b !important; color: #fff !important; }
 </style>
 </head>
@@ -83,6 +86,7 @@
   <video id="localVideo" autoplay playsinline muted></video>
   <div id="callStatus">연결하는 중…</div>
   <div id="diag"></div>
+  <button id="soundBtn" class="hidden">🔊 상대 소리가 안 들리면 누르세요</button>
   <div id="controls">
     <button id="micBtn" title="마이크">🎤</button>
     <button id="camBtn" title="카메라">📷</button>
@@ -535,6 +539,8 @@ async function join() {
   // 통화 소리가 수화기 쪽으로 가거나 묻혀 상대 목소리가 안 들릴 수 있다. 오디오 요소로 만들고,
   // 모바일은 사용자가 누른 순간에 한 번 재생해 둔 요소만 나중에 소리를 낼 수 있어 여기서 잠금을 푼다.
   state.beepAudio = prepareReadyBeep();
+  // 상대 소리 재생기도 터치 순간에 한 번 재생을 걸어 둔다 — 나중에 소리가 와도 막히지 않게
+  try { el('remoteVideo').play().catch(() => {}); } catch (e) {}
   setStatus(state.audioOnly ? '마이크를 여는 중…' : '카메라·마이크를 여는 중…');
   let stream = null;
   if (!state.audioOnly) {
@@ -556,14 +562,20 @@ async function join() {
   const pc = new RTCPeerConnection(RTC_CONFIG);
   state.pc = pc;
   for (const track of stream.getTracks()) pc.addTrack(track, stream);
-  pc.ontrack = (event) => { if (event.streams[0]) el('remoteVideo').srcObject = event.streams[0]; };
+  pc.ontrack = (event) => {
+    if (!event.streams[0]) return;
+    const player = el('remoteVideo');
+    player.srcObject = event.streams[0];
+    player.muted = false;
+    player.play().catch(() => {});
+  };
   pc.onconnectionstatechange = () => {
     if (state.finished) return;
     if (pc.connectionState === 'connected') {
       const first = !state.connected;
       state.connected = true;
       markAudioPriority(pc);   // 소리 패킷에 QoS 우선 표시 (지원 브라우저만 — 안 돼도 무해)
-      if (first) { announceReady(pc); startAudioDiag(pc); }   // 상대 소리가 실제로 오기 시작하면 "지금 말씀하세요"
+      if (first) { announceReady(pc); startAudioDiag(pc); showSoundButton(); }   // 상대 소리가 실제로 오기 시작하면 "지금 말씀하세요"
       else setCallStatus(state.audioOnly ? '음성통화 중' : '');
     }
     else if (pc.connectionState === 'failed') endCall('연결이 끊어졌습니다');
@@ -748,6 +760,26 @@ async function announceReady(pc) {
     status.classList.remove('ready');
     if (!state.finished && pc.connectionState === 'connected') setCallStatus(state.audioOnly ? '음성통화 중' : '');
   });
+}
+
+/** "상대 소리가 안 들리면 누르세요" 단추를 20초 동안 보여 준다.
+ *  누르면(사용자 동작 안에서) 재생기를 다시 붙여 재생한다 — 안드로이드 크롬이 사용자 동작 전에는
+ *  소리를 막는 경우가 있어서다(볼륨 단추를 한 번 눌러도 풀린다). */
+function showSoundButton() {
+  const btn = el('soundBtn');
+  btn.classList.remove('hidden');
+  btn.onclick = () => {
+    const player = el('remoteVideo');
+    const stream = player.srcObject;
+    player.srcObject = null;
+    player.srcObject = stream;
+    player.muted = false;
+    player.volume = 1;
+    player.play().catch(() => {});
+    btn.textContent = '🔊 소리를 다시 켰습니다';
+    later(1500, () => btn.classList.add('hidden'));
+  };
+  later(20000, () => btn.classList.add('hidden'));
 }
 
 /** 상대 소리 재생기를 확실히 재생시킨다. 브라우저가 자동재생을 막으면 화면을 한 번 눌러 달라고 하고, 누르면 재생한다. */
