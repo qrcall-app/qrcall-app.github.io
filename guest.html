@@ -243,7 +243,6 @@ const state = {
   offerReceived: false, ringReceived: false, connected: false, finished: false,
   lastReOfferSdp: null,   // 통화 중 새 경로 제안(ICE 재시작)의 중복 처리 방지
   wakeLock: null,         // 통화 중 화면 꺼짐 방지 (전화 앱처럼)
-  beepAudio: null,        // "말씀하세요" 신호음 — 상대 목소리와 같은 경로(오디오 요소)로 낸다
   deadline: 0,
   timers: [],
 };
@@ -535,12 +534,6 @@ function setCallStatus(text) { el('callStatus').textContent = text; }
 async function join() {
   el('joinBtn').classList.add('hidden');
   // 모바일 브라우저는 사용자가 누른 순간에 만든 오디오만 나중에 소리를 낼 수 있다
-  // 신호음은 웹 오디오(AudioContext)로 내지 않는다: 안드로이드 크롬에서 마이크를 켜기 전에 웹 오디오를 열어 두면
-  // 통화 소리가 수화기 쪽으로 가거나 묻혀 상대 목소리가 안 들릴 수 있다. 오디오 요소로 만들고,
-  // 모바일은 사용자가 누른 순간에 한 번 재생해 둔 요소만 나중에 소리를 낼 수 있어 여기서 잠금을 푼다.
-  state.beepAudio = prepareReadyBeep();
-  // 상대 소리 재생기도 터치 순간에 한 번 재생을 걸어 둔다 — 나중에 소리가 와도 막히지 않게
-  try { el('remoteVideo').play().catch(() => {}); } catch (e) {}
   setStatus(state.audioOnly ? '마이크를 여는 중…' : '카메라·마이크를 여는 중…');
   let stream = null;
   if (!state.audioOnly) {
@@ -562,13 +555,10 @@ async function join() {
   const pc = new RTCPeerConnection(RTC_CONFIG);
   state.pc = pc;
   for (const track of stream.getTracks()) pc.addTrack(track, stream);
-  pc.ontrack = (event) => {
-    if (!event.streams[0]) return;
-    const player = el('remoteVideo');
-    player.srcObject = event.streams[0];
-    player.muted = false;
-    player.play().catch(() => {});
-  };
+  // 상대 소리는 붙이기만 한다(autoplay 가 재생). 이 페이지에서 다른 소리(신호음 등)를 먼저 재생하거나
+  // 재생을 미리 걸어 두면 안드로이드 크롬이 소리를 통화 경로가 아닌 곳으로 보내, 볼륨 단추를 눌러야 들리고
+  // 에코 제거도 안 되는 문제가 있었다(2026-11-13~14). 신호음을 다시 넣을 때는 이 점을 먼저 확인할 것.
+  pc.ontrack = (event) => { if (event.streams[0]) el('remoteVideo').srcObject = event.streams[0]; };
   pc.onconnectionstatechange = () => {
     if (state.finished) return;
     if (pc.connectionState === 'connected') {
@@ -754,7 +744,6 @@ async function announceReady(pc) {
   const status = el('callStatus');
   status.classList.add('ready');
   setCallStatus('연결됐습니다 — 지금 말씀하세요');
-  playReadyBeep();
   try { navigator.vibrate?.(150); } catch (e) {}
   later(4000, () => {
     status.classList.remove('ready');
@@ -790,61 +779,10 @@ async function ensurePlaying(player) {
   try { await player.play(); } catch (e) { /* 다음 확인에서 다시 */ }
 }
 
-/** "띠-띵" 신호음(880Hz→1320Hz, 각 0.14초)을 WAV 로 만들어 오디오 요소에 담는다.
- *  사용자 터치(통화하기) 안에서 소리 없이 한 번 재생해 잠금을 풀어 둔다. 실패하면 null — 신호음 없이 진행. */
-function prepareReadyBeep() {
-  try {
-    const audio = new Audio(URL.createObjectURL(new Blob([makeBeepWav()], { type: 'audio/wav' })));
-    audio.muted = true;
-    audio.play().then(() => { audio.pause(); audio.currentTime = 0; audio.muted = false; })
-      .catch(() => { audio.muted = false; });
-    return audio;
-  } catch (e) { return null; }
-}
-
-/** 16kHz 모노 16비트 PCM WAV: 두 음, 각 음은 끝이 튀지 않게 앞뒤를 부드럽게 줄인다 */
-function makeBeepWav() {
-  const rate = 16000;
-  const tones = [[880, 0.14], [0, 0.02], [1320, 0.14]];   // [주파수, 길이(초)] — 0 은 쉼
-  const total = tones.reduce((n, [, sec]) => n + Math.round(rate * sec), 0);
-  const buf = new ArrayBuffer(44 + total * 2);
-  const v = new DataView(buf);
-  const str = (o, t) => { for (let i = 0; i < t.length; i++) v.setUint8(o + i, t.charCodeAt(i)); };
-  str(0, 'RIFF'); v.setUint32(4, 36 + total * 2, true); str(8, 'WAVE');
-  str(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
-  v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
-  str(36, 'data'); v.setUint32(40, total * 2, true);
-  let o = 44;
-  for (const [freq, sec] of tones) {
-    const n = Math.round(rate * sec);
-    const fade = Math.round(rate * 0.01);
-    for (let i = 0; i < n; i++) {
-      const env = freq ? Math.min(1, i / fade, (n - 1 - i) / fade) : 0;
-      v.setInt16(o, Math.round(Math.sin(2 * Math.PI * freq * i / rate) * env * 0.5 * 32767), true);
-      o += 2;
-    }
-  }
-  return buf;
-}
-
-/** 신호음을 낸다. 소리를 못 내도(차단·미지원) 조용히 넘어간다 — 화면 안내와 진동은 그대로 나온다. */
-function playReadyBeep() {
-  const audio = state.beepAudio;
-  if (!audio) return;
-  try {
-    audio.currentTime = 0;
-    audio.play().catch(() => {});
-  } catch (e) {}
-}
-
 function endCall(reason) {
   if (state.finished) return;
   state.finished = true;
   state.running = false;
-  try {
-    if (state.beepAudio) { state.beepAudio.pause(); URL.revokeObjectURL(state.beepAudio.src); }
-  } catch (e) {}
-  state.beepAudio = null;
   try { state.wakeLock?.release(); } catch (e) {}
   state.wakeLock = null;
   clearTimers();
