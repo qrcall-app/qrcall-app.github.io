@@ -41,10 +41,19 @@
                 box-shadow: 0 2px 10px rgba(0,0,0,.5); }
   #callStatus { position: absolute; left: 0; right: 0; top: 14px; text-align: center;
                 color: #fff; text-shadow: 0 1px 4px #000; font-size: 15px; }
+  /* 상대가 받아 소리가 오가기 시작한 순간 — 지금 말해도 된다는 표시 */
+  #callStatus.ready { top: 40%; font-size: 24px; font-weight: 700; color: #7CFFB2; }
+  /* 시험용 소리 진단 한 줄 — 출시 전에 SHOW_AUDIO_DIAG 를 false 로 */
+  #diag { position: absolute; left: 0; right: 0; bottom: 96px; text-align: center;
+          color: #9aa4b2; font-size: 11px; font-family: monospace; text-shadow: 0 1px 2px #000; }
   #controls { position: absolute; left: 0; right: 0; bottom: max(20px, env(safe-area-inset-bottom));
               display: flex; justify-content: center; gap: 18px; }
   #controls button { width: 60px; height: 60px; padding: 0; font-size: 24px; background: rgba(255,255,255,.18); color: #fff; }
   #controls button.off { background: rgba(255,255,255,.85); color: #111; }
+  /* 안드로이드(특히 삼성 12+) 통화 모드 버그: 볼륨 키를 한 번 눌러야 소리 경로가 잡힌다 — 웹에서는 대신 눌러 줄 수 없어 안내한다 */
+  #volumeHint { position: absolute; left: 16px; right: 16px; bottom: 120px; padding: 14px 16px; border-radius: 14px;
+                background: #1E56C8; color: #fff; font-size: 17px; font-weight: 700; line-height: 1.35; text-align: center; }
+  #volumeHint small { display: block; font-weight: 400; font-size: 13px; opacity: .9; margin-top: 4px; }
   #hangup { background: #e23b3b !important; color: #fff !important; }
 </style>
 </head>
@@ -77,6 +86,8 @@
   <video id="remoteVideo" autoplay playsinline></video>
   <video id="localVideo" autoplay playsinline muted></video>
   <div id="callStatus">연결하는 중…</div>
+  <div id="diag"></div>
+  <div id="volumeHint" class="hidden">🔊 소리가 안 들리면 옆면 <u>볼륨 올림(+)</u> 단추를 한 번 누르세요<small>일부 안드로이드 폰은 볼륨 키를 눌러야 통화 소리가 켜집니다 · 누르면 이 안내가 닫힙니다</small></div>
   <div id="controls">
     <button id="micBtn" title="마이크">🎤</button>
     <button id="camBtn" title="카메라">📷</button>
@@ -351,7 +362,37 @@ function onRing() {
   if (state.finished || state.offerReceived || state.ringReceived) return;
   state.ringReceived = true;
   state.deadline = Date.now() + 120000;
-  setCallStatus('벨이 울리는 중 — 상대가 받기를 기다립니다…');
+  setCallStatus('벨이 울리는 중 — 상대가 받으면 화면에 알려 드립니다');
+}
+
+/** 상대 SDP 를 적용하기 직전에 소리 패킷 헤더를 줄인다 (앱 쪽 call_tuning.dart 의 compactRemoteAudioSdp 와 같은 규칙).
+ *  음성 패킷은 헤더(IP·UDP·RTP·SRTP 약 50바이트 + 헤더 확장)가 소리보다 클 때가 많다.
+ *  ① a=ptime:40 — 내 송신기가 40ms 씩 묶어 패킷 수·헤더가 절반 (지연 +20ms)
+ *  ② 1:1 직결 통화에서 쓰지 않는 헤더 확장을 협상에서 뺀다 (mid·transport-cc 는 남김)
+ *  상대가 "이렇게 말했다"로 받아들이는 원격 설명만 고친다 — 내 SDP 를 고치는 것보다 안전하다. */
+const AUDIO_PTIME_MS = 40;
+const DROPPED_AUDIO_EXTENSIONS = [
+  'urn:ietf:params:rtp-hdrext:ssrc-audio-level',
+  'urn:ietf:params:rtp-hdrext:csrc-audio-level',
+  'http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time',
+  'http://www.webrtc.org/experiments/rtp-hdrext/abs-capture-time',
+  'http://www.webrtc.org/experiments/rtp-hdrext/inband-cn',
+];
+function compactRemoteAudioSdp(sdp) {
+  try {
+    if (!sdp) return sdp;
+    const nl = sdp.includes('\r\n') ? '\r\n' : '\n';
+    const lines = sdp.split(nl);
+    const start = lines.findIndex((l) => l.startsWith('m=audio '));
+    if (start < 0) return sdp;
+    let end = lines.findIndex((l, i) => i > start && l.startsWith('m='));
+    if (end < 0) end = lines.length;
+    while (end > start + 1 && lines[end - 1] === '') end--;
+    const section = lines.slice(start, end).filter((l) =>
+      !l.startsWith('a=ptime:') && !(l.startsWith('a=extmap:') && DROPPED_AUDIO_EXTENSIONS.some((u) => l.includes(u))));
+    section.push('a=ptime:' + AUDIO_PTIME_MS);
+    return lines.slice(0, start).concat(section, lines.slice(end)).join(nl);
+  } catch (e) { return sdp; }   // 어떤 SDP 가 와도 통화 자체는 깨뜨리지 않는다
 }
 
 /** SDP 의 Opus 항목에 품질 옵션을 넣는다 (앱 쪽 call_tuning.dart 와 같은 값).
@@ -418,10 +459,10 @@ async function onOffer(message) {
     return;
   }
   state.offerReceived = true;
-  setCallStatus('연결하는 중…');
+  setCallStatus('상대가 받았습니다 — 연결하는 중… 초록 글씨가 뜨면 말씀하세요');
   try {
     const pc = state.pc;
-    await pc.setRemoteDescription({ type: 'offer', sdp: message.sdp });
+    await pc.setRemoteDescription({ type: 'offer', sdp: compactRemoteAudioSdp(message.sdp) });
     const answer = await pc.createAnswer();
     answer.sdp = tuneOpusSdp(answer.sdp);
     await pc.setLocalDescription(answer);
@@ -439,7 +480,7 @@ async function onOffer(message) {
 async function onReOffer(message) {
   try {
     const pc = state.pc;
-    await pc.setRemoteDescription({ type: 'offer', sdp: message.sdp });
+    await pc.setRemoteDescription({ type: 'offer', sdp: compactRemoteAudioSdp(message.sdp) });
     const answer = await pc.createAnswer();
     answer.sdp = tuneOpusSdp(answer.sdp);
     await pc.setLocalDescription(answer);
@@ -460,13 +501,32 @@ function onBye(message) {
   endCall(reasons[message.reason] || '상대가 통화를 끝냈습니다');
 }
 
+/** 후보 수집을 기다린다. 공인 주소 후보(srflx)가 하나 오면 0.3초만 더 기다리고 끝낸다 —
+ *  '수집 완료'는 응답 없는 STUN 서버·쓰지 않는 망 때문에 몇 초씩 늦어지기 일쑤라, 그때까지 기다리면 연결이 그만큼 늦는다.
+ *  공인 주소를 못 얻으면(STUN 막힘) timeoutMs 까지 기다린다. 앱 쪽 call_media.dart 와 같은 규칙. */
 function waitIceGathering(pc, timeoutMs) {
   if (pc.iceGatheringState === 'complete') return Promise.resolve();
   return new Promise((resolve) => {
-    const timer = setTimeout(resolve, timeoutMs);
-    pc.addEventListener('icegatheringstatechange', () => {
-      if (pc.iceGatheringState === 'complete') { clearTimeout(timer); resolve(); }
-    });
+    let done = false;
+    let grace = null;
+    const isSrflx = (text) => typeof text === 'string' && text.includes(' typ srflx');
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      if (grace) clearTimeout(grace);
+      pc.removeEventListener('icegatheringstatechange', onState);
+      pc.removeEventListener('icecandidate', onCandidate);
+      resolve();
+    };
+    const finishSoon = () => { if (!grace && !done) grace = setTimeout(finish, 300); };
+    const onState = () => { if (pc.iceGatheringState === 'complete') finish(); };
+    const onCandidate = (e) => { if (e.candidate && isSrflx(e.candidate.candidate)) finishSoon(); };
+    const timer = setTimeout(finish, timeoutMs);
+    pc.addEventListener('icegatheringstatechange', onState);
+    pc.addEventListener('icecandidate', onCandidate);
+    // 미리 모아 둔 후보(iceCandidatePoolSize)로 이미 공인 주소가 들어 있을 수 있다
+    if (pc.localDescription && isSrflx(pc.localDescription.sdp)) finishSoon();
   });
 }
 
@@ -474,6 +534,7 @@ function setCallStatus(text) { el('callStatus').textContent = text; }
 
 async function join() {
   el('joinBtn').classList.add('hidden');
+  // 모바일 브라우저는 사용자가 누른 순간에 만든 오디오만 나중에 소리를 낼 수 있다
   setStatus(state.audioOnly ? '마이크를 여는 중…' : '카메라·마이크를 여는 중…');
   let stream = null;
   if (!state.audioOnly) {
@@ -495,13 +556,18 @@ async function join() {
   const pc = new RTCPeerConnection(RTC_CONFIG);
   state.pc = pc;
   for (const track of stream.getTracks()) pc.addTrack(track, stream);
+  // 상대 소리는 붙이기만 한다(autoplay 가 재생). 이 페이지에서 다른 소리(신호음 등)를 먼저 재생하거나
+  // 재생을 미리 걸어 두면 안드로이드 크롬이 소리를 통화 경로가 아닌 곳으로 보내, 볼륨 단추를 눌러야 들리고
+  // 에코 제거도 안 되는 문제가 있었다(2026-11-13~14). 신호음을 다시 넣을 때는 이 점을 먼저 확인할 것.
   pc.ontrack = (event) => { if (event.streams[0]) el('remoteVideo').srcObject = event.streams[0]; };
   pc.onconnectionstatechange = () => {
     if (state.finished) return;
     if (pc.connectionState === 'connected') {
+      const first = !state.connected;
       state.connected = true;
-      setCallStatus(state.audioOnly ? '음성통화 중' : '');
       markAudioPriority(pc);   // 소리 패킷에 QoS 우선 표시 (지원 브라우저만 — 안 돼도 무해)
+      if (first) { announceReady(pc); startAudioDiag(pc); showVolumeHint(); }   // 상대 소리가 실제로 오기 시작하면 "지금 말씀하세요"
+      else setCallStatus(state.audioOnly ? '음성통화 중' : '');
     }
     else if (pc.connectionState === 'failed') endCall('연결이 끊어졌습니다');
     else if (pc.connectionState === 'disconnected') {
@@ -586,6 +652,126 @@ async function keepScreenAwake() {
       try { state.wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
     }
   });
+}
+
+/** 시험용: 통화 중 소리가 어디서 막히는지 한 줄로 보여 준다 (출시 전에 false).
+ *  받음 = 상대 소리 패킷/초, 음량 = 받은 소리의 실제 크기(0~1), 보냄 = 내 소리 패킷/초,
+ *  코덱 = 협상된 형식, 재생 = 재생기 상태. 읽는 법:
+ *  - 받음 0            → 상대 소리가 아예 안 옴 (전송·협상 문제)
+ *  - 받음 >0, 음량 0   → 상대가 무음을 보냄 (상대 앱의 마이크 문제)
+ *  - 받음 >0, 음량 >0  → 소리는 왔는데 안 들림 (이 폰의 재생·출력 문제) */
+const SHOW_AUDIO_DIAG = true;
+function startAudioDiag(pc) {
+  if (!SHOW_AUDIO_DIAG) return;
+  let lastRx = null, lastTx = null, peak = 0, peakAt = 0;
+  const tick = async () => {
+    if (state.finished) return;
+    try {
+      let rx = 0, tx = 0, level = 0, codecId = null;
+      const codecs = new Map();
+      (await pc.getStats()).forEach((r) => {
+        if (r.type === 'codec') codecs.set(r.id, r);
+        if ((r.kind || r.mediaType) !== 'audio') return;
+        if (r.type === 'inbound-rtp') { rx += r.packetsReceived || 0; level = Math.max(level, r.audioLevel || 0); codecId = r.codecId; }
+        if (r.type === 'outbound-rtp') tx += r.packetsSent || 0;
+      });
+      // 음량은 순간값이라 2초 동안의 최댓값을 보여 준다 (말 사이의 쉼에 0 이 찍히는 것을 피함)
+      const now = Date.now();
+      if (level >= peak || now - peakAt > 2000) { peak = level; peakAt = now; }
+      const codec = codecs.get(codecId);
+      const mime = codec ? String(codec.mimeType || '').replace('audio/', '') : '?';
+      const player = el('remoteVideo');
+      const play = player.paused ? '멈춤' : (player.muted ? '음소거' : '재생 ' + Math.round(player.volume * 100) + '%');
+      const rxRate = lastRx === null ? '-' : String(rx - lastRx);
+      const txRate = lastTx === null ? '-' : String(tx - lastTx);
+      lastRx = rx; lastTx = tx;
+      el('diag').textContent = `받음 ${rxRate}/초 · 음량 ${peak.toFixed(2)} · 보냄 ${txRate}/초 · ${mime} · ${play}`;
+    } catch (e) { el('diag').textContent = '진단 읽기 실패'; }
+    later(1000, tick);
+  };
+  tick();
+}
+
+/** "지금 말씀하세요" — 정확해야 한다. 아래가 모두 실제로 확인된 순간에만 띄운다 (추측·시간 초과로 띄우지 않는다).
+ *  ① 연결(ICE·DTLS)이 양방향으로 확인됨 — connectionState 'connected' 가 그 뜻이다
+ *  ② 상대(앱) 소리가 실제로 계속 들어옴 — 실제로 해독된(가짜로 메운 것 제외) 소리가 0.2초 분량 이상.
+ *     해독 수치를 못 읽는 브라우저는 받은 패킷 10개 이상으로 본다.
+ *     앱은 마이크 녹음이 시작돼야 패킷을 보내므로, 이것은 상대 쪽 오디오 장치가 돌기 시작했다는 증거이기도 하다
+ *  ③ 내 소리가 실제로 나가고 있음 — 보낸 소리 패킷 5개(40ms 묶음이면 0.2초) 이상, 마이크 트랙이 살아 있고 켜져 있음
+ *  ④ 상대 소리를 실제로 재생 중 — 재생기가 멈춰 있지 않음 (모바일 자동재생 차단이면 한 번 눌러 달라고 한다)
+ *  확인이 늦으면 "아직 말씀하지 마세요"를 띄우고 계속 기다린다. */
+async function announceReady(pc) {
+  const MIN_RECEIVED_SAMPLES = 48000 * 0.2;   // 실제로 해독된 상대 소리 0.2초 (Opus 는 48kHz)
+  const MIN_RECEIVED_PACKETS = 10;              // 위 수치를 못 읽는 브라우저용
+  const MIN_SENT_PACKETS = 5;
+  const started = Date.now();
+  let slowShown = false;
+  while (!state.finished) {
+    if (pc.connectionState === 'connected') {
+      let receivedPackets = 0;
+      let decodedSamples = null;   // 실제로 해독된 소리 표본 수 (가짜로 메운 것 제외)
+      let sent = 0;
+      try {
+        (await pc.getStats()).forEach((r) => {
+          if ((r.kind || r.mediaType) !== 'audio') return;
+          if (r.type === 'inbound-rtp') {
+            receivedPackets += r.packetsReceived || 0;
+            if (typeof r.totalSamplesReceived === 'number') {
+              decodedSamples = (decodedSamples || 0) + r.totalSamplesReceived - (r.concealedSamples || 0);
+            }
+          }
+          if (r.type === 'outbound-rtp') sent += r.packetsSent || 0;
+        });
+      } catch (e) { /* 다음 확인에서 다시 */ }
+      const receivedOk = decodedSamples !== null
+        ? decodedSamples >= MIN_RECEIVED_SAMPLES
+        : receivedPackets >= MIN_RECEIVED_PACKETS;
+      const mic = state.localStream && state.localStream.getAudioTracks()[0];
+      if (mic && mic.readyState === 'live' && !mic.enabled) {
+        setCallStatus('마이크가 꺼져 있습니다 — 🎤 단추를 눌러 켜 주세요');
+      } else if (receivedOk && sent >= MIN_SENT_PACKETS && mic && mic.readyState === 'live') {
+        const player = el('remoteVideo');
+        if (player.paused) await ensurePlaying(player);
+        if (!player.paused && !state.finished) break;   // ①~④ 모두 확인
+      }
+    }
+    if (!slowShown && Date.now() - started > 5000) {
+      slowShown = true;
+      setCallStatus('소리 연결을 확인하는 중… 아직 말씀하지 마세요');
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  if (state.finished) return;
+  const status = el('callStatus');
+  status.classList.add('ready');
+  setCallStatus('연결됐습니다 — 지금 말씀하세요');
+  try { navigator.vibrate?.(150); } catch (e) {}
+  later(4000, () => {
+    status.classList.remove('ready');
+    if (!state.finished && pc.connectionState === 'connected') setCallStatus(state.audioOnly ? '음성통화 중' : '');
+  });
+}
+
+/** 안드로이드 방문자에게 "안 들리면 볼륨 올림(+)을 한 번 누르세요" 안내를 띄운다.
+ *  크롬은 마이크를 열면 폰을 통화 모드로 바꾸는데, 안드로이드 12+ (특히 삼성)에는 통화 모드의 출력 장치가
+ *  볼륨 키를 누르기 전까지 잡히지 않는 버그가 있다. 네이티브 앱은 코드로 볼륨을 한 번 건드려 피하지만
+ *  (개발자들이 "hack for samsung no audio bug" 라고 부른다) 웹 페이지는 OS 볼륨을 건드릴 수 없다.
+ *  그래서 재생을 다시 거는 단추로는 해결되지 않고, 사용자가 직접 누르게 안내하는 것이 웹에서 가능한 전부다.
+ *  다른 폰 방문자는 그냥 들리므로 안내는 45초 뒤 또는 누르면 사라진다. */
+function showVolumeHint() {
+  if (!/Android/i.test(navigator.userAgent)) return;   // 아이폰·PC 에는 이 버그가 없다
+  const hint = el('volumeHint');
+  hint.classList.remove('hidden');
+  hint.onclick = () => hint.classList.add('hidden');
+  later(45000, () => hint.classList.add('hidden'));
+}
+
+/** 상대 소리 재생기를 확실히 재생시킨다. 브라우저가 자동재생을 막으면 화면을 한 번 눌러 달라고 하고, 누르면 재생한다. */
+async function ensurePlaying(player) {
+  try { await player.play(); return; } catch (e) { /* 자동재생 막힘 */ }
+  setCallStatus('화면을 한 번 눌러 상대 소리를 켜 주세요');
+  await new Promise((resolve) => document.addEventListener('pointerdown', resolve, { once: true }));
+  try { await player.play(); } catch (e) { /* 다음 확인에서 다시 */ }
 }
 
 function endCall(reason) {
