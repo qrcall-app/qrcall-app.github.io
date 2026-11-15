@@ -50,7 +50,7 @@
   #callStatus.ready { top: 40%; font-size: 24px; font-weight: 700; color: #7CFFB2; }
   /* 시험용 소리 진단 한 줄 — 출시 전에 SHOW_AUDIO_DIAG 를 false 로 */
   #diag { position: absolute; left: 0; right: 0; bottom: 96px; text-align: center;
-          color: #9aa4b2; font-size: 11px; font-family: monospace; text-shadow: 0 1px 2px #000; }
+          color: #ffd966; font-size: 13px; font-family: monospace; text-shadow: 0 1px 2px #000; }
   #controls { position: absolute; left: 0; right: 0; bottom: max(20px, env(safe-area-inset-bottom));
               display: flex; justify-content: center; gap: 18px; }
   #controls button { width: 60px; height: 60px; padding: 0; font-size: 24px; background: rgba(255,255,255,.18); color: #fff; }
@@ -555,7 +555,11 @@ function lockCallScreen() {
   el('call').addEventListener('pointerdown', () => { if (!state.finished) requestCallFullscreen(); });
 }
 
+// 2026-11-15 시험: 전체화면을 넣은 바로 다음 통화에서 "방문자 폰 소리 안 들림"이 다시 나왔다. 연관이 있는지 가르기 위해
+// 잠시 끈다 — 이 상태에서도 안 들리면 전체화면과 무관한 것이다. 확인되면 true 로 되돌린다.
+const LOCK_FULLSCREEN = false;
 function requestCallFullscreen() {
+  if (!LOCK_FULLSCREEN) return;
   const root = document.documentElement;
   if (document.fullscreenElement || typeof root.requestFullscreen !== 'function') return;   // 아이폰 사파리 등 미지원
   try { root.requestFullscreen({ navigationUI: 'hide' }).catch(() => {}); } catch (e) {}
@@ -707,6 +711,9 @@ const SHOW_AUDIO_DIAG = true;
 function startAudioDiag(pc) {
   if (!SHOW_AUDIO_DIAG) return;
   let lastRx = null, lastTx = null, peak = 0, peakAt = 0;
+  // 통화가 끝난 화면에 남길 요약 — 안 들렸던 통화의 증거를 방문자가 캡처해 줄 수 있게 (diagSummary)
+  state.diag = { connectedAt: Date.now(), readyAt: null, rx: 0, tx: 0, peakAll: 0, mime: '?', play: '?', aec: '?',
+                 fullscreen: !!document.fullscreenElement };
   const tick = async () => {
     if (state.finished) return;
     try {
@@ -728,11 +735,22 @@ function startAudioDiag(pc) {
       const rxRate = lastRx === null ? '-' : String(rx - lastRx);
       const txRate = lastTx === null ? '-' : String(tx - lastTx);
       lastRx = rx; lastTx = tx;
-      el('diag').textContent = `받음 ${rxRate}/초 · 음량 ${peak.toFixed(2)} · 보냄 ${txRate}/초 · ${mime} · ${play} · AEC ${effectiveAecMode()}`;
+      const aec = effectiveAecMode();
+      Object.assign(state.diag, { rx, tx, mime, play, aec, peakAll: Math.max(state.diag.peakAll, level) });
+      el('diag').textContent = `받음 ${rxRate}/초 · 음량 ${peak.toFixed(2)} · 보냄 ${txRate}/초 · ${mime} · ${play} · AEC ${aec}`;
     } catch (e) { el('diag').textContent = '진단 읽기 실패'; }
     later(1000, tick);
   };
   tick();
+}
+
+/** 통화 종료 화면에 남기는 한 줄 (SHOW_AUDIO_DIAG 일 때만). 연결이 안 됐으면 그 사실만 남긴다. */
+function diagSummary() {
+  const d = state.diag;
+  if (!d) return '연결 안 됨 (connected 없음)';
+  const seconds = Math.round((Date.now() - d.connectedAt) / 1000);
+  return `연결 ${seconds}초 · 말씀하세요 ${d.readyAt ? '뜸' : '안 뜸'} · 받음 ${d.rx}개 · 음량최대 ${d.peakAll.toFixed(2)}`
+    + ` · 보냄 ${d.tx}개 · ${d.mime} · ${d.play} · AEC ${d.aec} · 전체화면 ${d.fullscreen ? '예' : '아니오'}`;
 }
 
 /** "지금 말씀하세요" — 정확해야 한다. 아래가 모두 실제로 확인된 순간에만 띄운다 (추측·시간 초과로 띄우지 않는다).
@@ -775,7 +793,7 @@ async function announceReady(pc) {
       } else if (receivedOk && sent >= MIN_SENT_PACKETS && mic && mic.readyState === 'live') {
         const player = el('remoteVideo');
         if (player.paused) await ensurePlaying(player);
-        if (!player.paused && !state.finished) break;   // ①~④ 모두 확인
+        if (!player.paused && !state.finished) { if (state.diag) state.diag.readyAt = Date.now(); break; }   // ①~④ 모두 확인
       }
     }
     if (!slowShown && Date.now() - started > 5000) {
@@ -811,7 +829,9 @@ function effectiveAecMode() {
  *  그 값을 모르는 옛 브라우저(true 로 읽음)에만 띄운다. 안내는 45초 뒤 또는 누르면 사라진다. */
 function showVolumeHint() {
   if (!/Android/i.test(navigator.userAgent)) return;   // 아이폰·PC 에는 이 버그가 없다
-  if (effectiveAecMode() === 'remote-only') return;     // 통화 모드로 안 바뀌는 경로 — 버그가 나지 않는다
+  // 2026-11-15: remote-only 에서도 "안 들림"이 한 번 다시 나와, 원인이 가려질 때까지 안드로이드에는 항상 띄운다.
+  // (볼륨 키는 지금까지 매번 소리를 되살린 유일한 방법이다.) 가려지면 아래 줄을 다시 살린다.
+  // if (effectiveAecMode() === 'remote-only') return;
   const hint = el('volumeHint');
   hint.classList.remove('hidden');
   hint.onclick = () => hint.classList.add('hidden');
@@ -840,7 +860,7 @@ function endCall(reason) {
   el('call').classList.add('hidden');
   el('setup').classList.remove('hidden');
   el('intro').textContent = reason;
-  setStatus('창을 닫아도 됩니다.');
+  setStatus(SHOW_AUDIO_DIAG ? `창을 닫아도 됩니다. [진단] ${diagSummary()}` : '창을 닫아도 됩니다.');
 }
 
 function toggleTrack(kinds, button) {
