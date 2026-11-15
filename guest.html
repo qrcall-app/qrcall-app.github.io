@@ -86,6 +86,7 @@
       · 지금 열린 주소: <b id="trustHost"></b> — 인쇄물에 적힌 주소와 같은지 확인하세요.
     </div>
   </details>
+  <div id="build" class="note" style="font-size:11px; opacity:.6;"></div>
 </main>
 <div id="call" class="hidden">
   <video id="remoteVideo" autoplay playsinline></video>
@@ -243,6 +244,9 @@ const RTC_CONFIG = { iceServers: [
 // (마이크를 안 여는 guidecast listen.html 이 늘 들리는 것과 같은 경로). 지원 안 하는 브라우저는 이 문자열을 true 로 읽는다.
 const AUDIO_OPTS = { echoCancellation: 'remote-only', noiseSuppression: true, autoGainControl: true };
 
+// 페이지 판 — 첫 화면 아래에 보이고, 호스팅 캐시 때문에 옛 판이 열렸을 때 새 판으로 바꾸는 기준 (refreshIfStale). 올릴 때마다 바꾼다.
+const PAGE_BUILD = 'b2026-11-15d';
+
 const el = (id) => document.getElementById(id);
 const setStatus = (text) => { el('status').textContent = text; };
 
@@ -251,6 +255,7 @@ const state = {
   running: false, aborter: null,
   pc: null, localStream: null,
   offerReceived: false, ringReceived: false, connected: false, finished: false,
+  joinStarted: false,     // [통화하기]를 눌렀다 — 자동 새 판 열기(refreshIfStale)를 멈추는 기준
   lastReOfferSdp: null,   // 통화 중 새 경로 제안(ICE 재시작)의 중복 처리 방지
   wakeLock: null,         // 통화 중 화면 꺼짐 방지 (전화 앱처럼)
   deadline: 0,
@@ -579,6 +584,7 @@ function unlockCallScreen() {
 }
 
 async function join() {
+  state.joinStarted = true;   // 이 뒤로는 refreshIfStale 이 페이지를 새로 열지 않는다
   el('joinBtn').classList.add('hidden');
   lockCallScreen();   // 전체화면은 사용자 터치 안에서만 허용되므로 await 전에 부른다
   // 모바일 브라우저는 사용자가 누른 순간에 만든 오디오만 나중에 소리를 낼 수 있다
@@ -871,8 +877,25 @@ function toggleTrack(kinds, button) {
   button.classList.toggle('off', !enabled);
 }
 
+/** 호스팅 캐시(GitHub Pages 최대 10분) 때문에 옛 판이 열렸으면 새 판으로 한 번 다시 연다.
+ *  네트워크에서 받아 캐시를 갱신(cache: 'reload')하고 판이 다르면 reload. 같은 판으로는 한 번만(sessionStorage) 해 무한 반복을 막고,
+ *  이미 [통화하기]를 눌렀으면 통화를 끊지 않기 위해 건드리지 않는다. */
+async function refreshIfStale() {
+  try {
+    const res = await fetch(location.pathname, { cache: 'reload' });
+    const match = (await res.text()).match(/PAGE_BUILD = '(b[0-9a-z-]+)'/);
+    if (!match || match[1] === PAGE_BUILD) return;
+    if (sessionStorage.getItem('qrcall-reloaded') === match[1]) return;
+    if (state.joinStarted) return;
+    sessionStorage.setItem('qrcall-reloaded', match[1]);
+    location.reload();
+  } catch (e) { /* 망 문제 — 지금 판으로 그냥 간다 */ }
+}
+
 function main() {
   el('trustHost').textContent = location.host;   // "이 QR, 안전한가요?" 안내의 주소 확인용
+  el('build').textContent = '페이지 판 ' + PAGE_BUILD;
+  refreshIfStale();
   const parsed = parseLink();
   const keyBytes = parsed ? parsed.keyBytes : null;
   if (!keyBytes) {
