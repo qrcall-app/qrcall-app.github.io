@@ -55,6 +55,7 @@
               display: flex; justify-content: center; gap: 18px; }
   #controls button { width: 60px; height: 60px; padding: 0; font-size: 24px; background: rgba(255,255,255,.18); color: #fff; }
   #controls button.off { background: rgba(255,255,255,.85); color: #111; }
+  #controls button.armed { background: #e53935; color: #fff; transform: scale(1.12); }   /* 끊기 1단계: 한 번 더 누르면 끊김 */
   /* 안드로이드(특히 삼성 12+) 통화 모드 버그: 볼륨 키를 한 번 눌러야 소리 경로가 잡힌다 — 웹에서는 대신 눌러 줄 수 없어 안내한다 */
   #volumeHint { position: absolute; left: 16px; right: 16px; bottom: 120px; padding: 14px 16px; border-radius: 14px;
                 background: #1E56C8; color: #fff; font-size: 17px; font-weight: 700; line-height: 1.35; text-align: center; }
@@ -246,7 +247,8 @@ const RTC_CONFIG = { iceServers: [
 const AUDIO_OPTS = { echoCancellation: true, noiseSuppression: true, autoGainControl: true };
 
 // 페이지 판 — 첫 화면 아래에 보이고, 호스팅 캐시 때문에 옛 판이 열렸을 때 새 판으로 바꾸는 기준 (refreshIfStale). 올릴 때마다 바꾼다.
-const PAGE_BUILD = 'b2026-11-15g';
+const PAGE_BUILD = 'b2026-11-16a';
+const HANGUP_CONFIRM_MS = 2500;   // 끊기 단추를 두 번 누르는 간격
 
 const el = (id) => document.getElementById(id);
 const setStatus = (text) => { el('status').textContent = text; };
@@ -257,6 +259,7 @@ const state = {
   pc: null, localStream: null,
   offerReceived: false, ringReceived: false, connected: false, finished: false,
   joinStarted: false,     // [통화하기]를 눌렀다 — 자동 새 판 열기(refreshIfStale)를 멈추는 기준
+  hangupArmedAt: 0,       // 끊기 1단계를 누른 시각 — HANGUP_CONFIRM_MS 안에 한 번 더 누르면 끊는다
   routeId: null, routeLabel: null,              // 안드로이드 크롬의 통화 장치(수화기/스피커폰/헤드셋) — pickCommunicationDevice
   earpieceDevice: null, speakerDevice: null,
   lastReOfferSdp: null,   // 통화 중 새 경로 제안(ICE 재시작)의 중복 처리 방지
@@ -476,7 +479,7 @@ async function onOffer(message) {
     return;
   }
   state.offerReceived = true;
-  setCallStatus('상대가 받았습니다 — 연결하는 중… 초록 글씨가 뜨면 말씀하세요');
+  setCallStatus('상대가 받았습니다 — 연결하는 중… 신호음이 나면 말씀하세요');
   try {
     const pc = state.pc;
     await pc.setRemoteDescription({ type: 'offer', sdp: compactRemoteAudioSdp(message.sdp) });
@@ -563,9 +566,9 @@ function lockCallScreen() {
   el('call').addEventListener('pointerdown', () => { if (!state.finished) requestCallFullscreen(); });
 }
 
-// 2026-11-15 시험: 전체화면을 넣은 바로 다음 통화에서 "방문자 폰 소리 안 들림"이 다시 나왔다. 연관이 있는지 가르기 위해
-// 잠시 끈다 — 이 상태에서도 안 들리면 전체화면과 무관한 것이다. 확인되면 true 로 되돌린다.
-const LOCK_FULLSCREEN = false;
+// 2026-11-15 에 소리 문제 조사 중 잠시 꺼 두었다가, 소리 문제의 원인이 통화 장치 선택(pickCommunicationDevice)으로 확인된 뒤
+// 11-16 에 다시 켰다 — 전체화면은 소리와 무관하다.
+const LOCK_FULLSCREEN = true;
 function requestCallFullscreen() {
   if (!LOCK_FULLSCREEN) return;
   const root = document.documentElement;
@@ -779,7 +782,7 @@ async function keepScreenAwake() {
  *  - 받음 0            → 상대 소리가 아예 안 옴 (전송·협상 문제)
  *  - 받음 >0, 음량 0   → 상대가 무음을 보냄 (상대 앱의 마이크 문제)
  *  - 받음 >0, 음량 >0  → 소리는 왔는데 안 들림 (이 폰의 재생·출력 문제) */
-const SHOW_AUDIO_DIAG = true;
+const SHOW_AUDIO_DIAG = false;   // 출시용: 진단 줄·종료 요약 숨김. 소리 문제를 다시 볼 때만 true
 function startAudioDiag(pc) {
   if (!SHOW_AUDIO_DIAG) return;
   let lastRx = null, lastTx = null, peak = 0, peakAt = 0;
@@ -823,6 +826,36 @@ function diagSummary() {
   const seconds = Math.round((Date.now() - d.connectedAt) / 1000);
   return `연결 ${seconds}초 · 말씀하세요 ${d.readyAt ? '뜸' : '안 뜸'} · 받음 ${d.rx}개 · 음량최대 ${d.peakAll.toFixed(2)}`
     + ` · 보냄 ${d.tx}개 · ${d.mime} · ${d.play} · AEC ${d.aec} · 장치 ${state.routeLabel || '기본'} · 전체화면 ${d.fullscreen ? '예' : '아니오'}`;
+}
+
+/** "띠-띵" 신호음 — "지금 말씀하세요" 글씨·진동과 같은 순간에 울린다 (880Hz → 1320Hz, 각 0.14초).
+ *  11/13 에 "소리 안 들림"의 원인으로 잘못 짚어 뺐다가 11-16 에 복원. 주의: AudioContext 는 여기서(마이크를 연 뒤, 즉 폰이 통화
+ *  모드인 상태에서) 만든다 — 크롬 안드로이드는 출력 스트림의 용도를 만드는 순간의 모드로 정하므로, 통화 모드에서 만들어야 통화
+ *  경로(수화기)로 나가고, 통화 모드 전에 만들면 미디어 스트림이 되어 삼성에서 들리지 않는다(2026-11-15 실험). 재생이 끝나면 닫아
+ *  통화 소리와 섞이는 출력 스트림을 남기지 않는다. 사용자 터치는 [통화하기] 때 있었으므로 resume 이 허용된다. */
+async function playReadyTone() {
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    const ctx = new Ctx();
+    await ctx.resume();
+    const tone = (freq, at) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0.0001, at);
+      gain.gain.exponentialRampToValueAtTime(0.25, at + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, at + 0.14);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start(at);
+      osc.stop(at + 0.15);
+    };
+    const start = ctx.currentTime + 0.05;
+    tone(880, start);
+    tone(1320, start + 0.16);
+    setTimeout(() => { ctx.close().catch(() => {}); }, 700);
+  } catch (e) { /* 소리를 못 내도 글씨·진동은 나간다 */ }
 }
 
 /** "지금 말씀하세요" — 정확해야 한다. 아래가 모두 실제로 확인된 순간에만 띄운다 (추측·시간 초과로 띄우지 않는다).
@@ -878,6 +911,7 @@ async function announceReady(pc) {
   const status = el('callStatus');
   status.classList.add('ready');
   setCallStatus(state.routeLabel === 'Headset earpiece' ? '연결됐습니다 — 귀에 대고 말씀하세요' : '연결됐습니다 — 지금 말씀하세요');
+  playReadyTone();
   try { navigator.vibrate?.(150); } catch (e) {}
   later(4000, () => {
     status.classList.remove('ready');
@@ -999,7 +1033,20 @@ function main() {
     });
   }
   el('joinBtn').addEventListener('click', join);
+  // 끊기는 두 번 눌러야 한다 — 수화기로 통화할 때 뺨이 화면에 닿아 끊기는 일 방지 (웹은 근접 센서로 화면을 끄지 못한다)
   el('hangup').addEventListener('click', async () => {
+    const now = Date.now();
+    if (now - state.hangupArmedAt > HANGUP_CONFIRM_MS) {
+      state.hangupArmedAt = now;
+      el('hangup').classList.add('armed');
+      const before = el('callStatus').textContent;
+      setCallStatus('끊으려면 📵 를 한 번 더 누르세요');
+      later(HANGUP_CONFIRM_MS, () => {
+        el('hangup').classList.remove('armed');
+        if (!state.finished && el('callStatus').textContent === '끊으려면 📵 를 한 번 더 누르세요') setCallStatus(before);
+      });
+      return;
+    }
     try { await sendMessage('bye', {}); } catch (e) {}
     endCall('통화를 끝냈습니다');
   });
