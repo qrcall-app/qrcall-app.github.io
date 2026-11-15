@@ -33,8 +33,13 @@
   .primary { background: #0e9f8c; color: #fff; font-size: 18px; font-weight: 700; }
   .note { color: #9db8b4; font-size: 14px; line-height: 1.6; max-width: 32em; }
   #status { color: #cfe8e4; font-size: 15px; min-height: 1.4em; }
-  /* 통화 화면 */
-  #call { position: fixed; inset: 0; background: #000; display: flex; }
+  /* 통화 중 화면을 아래로 당겨도 새로고침(=통화 끊김)이 되지 않게 */
+  html, body { overscroll-behavior: none; }
+  /* 통화 화면 — 단추 말고는 손이 닿아도 아무 일도 없게: 스크롤·확대·글자 선택·길게 눌러 메뉴를 모두 끈다 */
+  #call { position: fixed; inset: 0; background: #000; display: flex;
+          touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+  /* 영상·글자는 터치를 받지 않는다 — 단추(#controls)와 안내(#volumeHint)만 받는다 */
+  #remoteVideo, #localVideo, #callStatus, #diag { pointer-events: none; }
   #remoteVideo { width: 100%; height: 100%; object-fit: contain; background: #000; }
   #localVideo { position: absolute; right: 12px; top: 12px; width: 28vw; max-width: 160px;
                 aspect-ratio: 3 / 4; object-fit: cover; border-radius: 12px; background: #15201e;
@@ -536,8 +541,42 @@ function waitIceGathering(pc, timeoutMs) {
 
 function setCallStatus(text) { el('callStatus').textContent = text; }
 
+/** 통화 화면 잠금 — 방문자 손이 닿아도 다른 화면으로 가거나 통화가 끊기지 않게 한다 (2026-11-15).
+ *  ① 전체화면: 크롬 주소창·탭 단추·시스템 바를 숨긴다 (주소창을 건드려 다른 화면으로 넘어가는 일 방지).
+ *     사용자 터치 안에서만 허용되므로 [통화하기]를 누른 바로 그때 요청하고, 풀리면 통화 화면을 건드릴 때 다시 잡는다.
+ *  ② 뒤로가기 보호: 기록을 하나 넣어 두고, 뒤로가기(제스처·단추)가 오면 통화를 지키고 안내만 띄운다. 크롬은 사용자 동작 없이
+ *     넣은 기록을 다음 뒤로가기에서 건너뛰므로 두 번째 뒤로가기는 그대로 나간다 — "한 번 더 누르면 나감" 꼴이라 가두는 것이 아니다.
+ *  ③ 단추 밖 영역은 CSS(#call 의 touch-action/user-select, 영상·글자의 pointer-events)로 아무 반응도 하지 않는다.
+ *  해제는 unlockCallScreen (endCall 과 마이크 실패 때). */
+function lockCallScreen() {
+  requestCallFullscreen();
+  history.pushState({ qrcallCall: true }, '');
+  addEventListener('popstate', onBackDuringCall);
+  el('call').addEventListener('pointerdown', () => { if (!state.finished) requestCallFullscreen(); });
+}
+
+function requestCallFullscreen() {
+  const root = document.documentElement;
+  if (document.fullscreenElement || typeof root.requestFullscreen !== 'function') return;   // 아이폰 사파리 등 미지원
+  try { root.requestFullscreen({ navigationUI: 'hide' }).catch(() => {}); } catch (e) {}
+}
+
+function onBackDuringCall() {
+  if (state.finished) return;
+  history.pushState({ qrcallCall: true }, '');
+  setCallStatus('통화 중입니다 — 끊으려면 📵 단추를 누르세요');
+  later(3000, () => { if (!state.finished && state.connected) setCallStatus(state.audioOnly ? '음성통화 중' : ''); });
+}
+
+function unlockCallScreen() {
+  removeEventListener('popstate', onBackDuringCall);
+  if (history.state && history.state.qrcallCall) history.back();
+  if (document.fullscreenElement) { try { document.exitFullscreen().catch(() => {}); } catch (e) {} }
+}
+
 async function join() {
   el('joinBtn').classList.add('hidden');
+  lockCallScreen();   // 전체화면은 사용자 터치 안에서만 허용되므로 await 전에 부른다
   // 모바일 브라우저는 사용자가 누른 순간에 만든 오디오만 나중에 소리를 낼 수 있다
   setStatus(state.audioOnly ? '마이크를 여는 중…' : '카메라·마이크를 여는 중…');
   let stream = null;
@@ -551,6 +590,7 @@ async function join() {
       stream = await navigator.mediaDevices.getUserMedia({ audio: AUDIO_OPTS });
       el('camBtn').classList.add('hidden');
     } catch (e) {
+      unlockCallScreen();
       el('joinBtn').classList.remove('hidden');
       setStatus('마이크를 허용해야 통화할 수 있습니다. 브라우저 주소창의 권한에서 허용해 주세요.');
       return;
@@ -796,6 +836,7 @@ function endCall(reason) {
   try { state.aborter?.abort(); } catch (e) {}
   try { state.pc?.close(); } catch (e) {}
   for (const track of state.localStream?.getTracks() ?? []) track.stop();
+  unlockCallScreen();
   el('call').classList.add('hidden');
   el('setup').classList.remove('hidden');
   el('intro').textContent = reason;
